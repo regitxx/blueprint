@@ -1,0 +1,5 @@
+{
+  "name": "Blueprint — idea to architecture in a minute",
+  "description": "Type a product idea. Three agents (Scout, Analyst, Architect) search arXiv and GitHub, extract what actually works, and return 2-3 cited architecture variants with diagrams and a trade-off table.",
+  "requestFramePermissions": []
+}
