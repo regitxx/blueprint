@@ -1,5 +1,7 @@
-// Sandbox smoke test: arXiv parser + Semantic Scholar mapper (offline) + live GitHub search.
+// Sandbox smoke test: arXiv parser + Semantic Scholar mapper + export builders (offline) + live GitHub search.
 import { mapSemanticScholar, parseArxivAtom, searchGithub } from '../services/sources';
+import { APP_URL, buildAdrMarkdown, buildAgentPrompt } from '../services/export';
+import type { RunResult } from '../types';
 
 const SAMPLE = `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
 <entry><id>http://arxiv.org/abs/2308.08155v2</id><published>2023-08-16T05:09:47Z</published>
@@ -34,6 +36,37 @@ if (mapped[0].origin !== 'arXiv' || mapped[0].url !== 'https://arxiv.org/abs/170
 if (!mapped[0].meta?.includes('et al.') || !mapped[0].meta?.includes('2017')) throw new Error('S2 mapper: meta failed');
 if (mapped[1].origin !== 'Paper' || mapped[1].url !== 'https://example.org/paper/2') throw new Error('S2 mapper: non-arXiv fallback failed');
 if (mapped.some((m) => !m.snippet)) throw new Error('S2 mapper: empty snippet');
+
+// Export builders (offline, canned RunResult).
+const CANNED_RUN: RunResult = {
+  topic: 'realtime collaborative whiteboard',
+  constraints: ['Must work fully offline', 'No vector database'],
+  sources: [
+    { id: 's1', kind: 'paper', title: 'CRDTs: An Overview', url: 'https://arxiv.org/abs/1805.06358', origin: 'arXiv', snippet: 'Convergent replicated data types.', meta: '2018' },
+    { id: 's2', kind: 'repo', title: 'excalidraw/excalidraw', url: 'https://github.com/excalidraw/excalidraw', origin: 'GitHub', snippet: 'Virtual whiteboard.', meta: '★ 80k' },
+  ],
+  insights: [],
+  variants: [
+    { id: 'v1', name: 'Sync-First MVP', profile: 'Fast MVP', tagline: 'Ship quick.', summary: 'A quick build.', mermaid: 'flowchart TD\nA["User"] --> B["Server"]', components: [{ name: 'Sync Server', role: 'state sync', sourceIds: ['s2'] }], risks: 'latency', whenToChoose: 'speed' },
+    { id: 'v2', name: 'CRDT Core', profile: 'Scalable', tagline: 'Converge locally.', summary: 'CRDT based.', mermaid: 'flowchart TD\nA["Client"] --> B["CRDT"]', components: [{ name: 'CRDT Engine', role: 'merge edits', sourceIds: ['s1'] }], risks: 'complexity', whenToChoose: 'scale' },
+  ],
+  comparison: [
+    { criterion: 'Time to MVP', values: ['days', 'weeks'] },
+    { criterion: 'Rough monthly cost (cloud + LLM)', values: ['~$20/mo', '~$200/mo'] },
+  ],
+};
+
+const adr = buildAdrMarkdown(CANNED_RUN);
+if (!adr.includes('```mermaid')) throw new Error('ADR: missing mermaid block');
+if (!adr.includes('Rough monthly cost (cloud + LLM)')) throw new Error('ADR: missing cost-row criterion');
+for (const s of CANNED_RUN.sources) if (!adr.includes(s.url)) throw new Error(`ADR: missing source url ${s.url}`);
+if (!adr.includes(APP_URL)) throw new Error('ADR: missing footer app link');
+console.log('ADR export: mermaid + cost row + all source urls + footer link ✓');
+
+const prompt = buildAgentPrompt(CANNED_RUN, 1);
+if (!prompt.includes('CRDT Core')) throw new Error('agent prompt: missing chosen variant name');
+if (!prompt.includes('No vector database')) throw new Error('agent prompt: missing constraint');
+console.log('Agent prompt: chosen variant + constraint ✓');
 
 const repos = await searchGithub('multi agent llm framework', 2);
 console.log('GitHub live:', repos.map(r => `${r.title} [${r.meta}] snippet:${r.snippet.slice(0, 60)}...`));

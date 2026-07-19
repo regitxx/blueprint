@@ -1,9 +1,10 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Results from './components/Results';
 import { CACHED_RUNS } from './constants';
 import { analyzeSources, interpretIdea, mapRepoArchitecture, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
 import { gatherSources } from './services/sources';
 import { fetchRepoSkeleton } from './services/repo';
+import { adrFilename, buildAdrMarkdown, buildAgentPrompt } from './services/export';
 import type { AgentName, Interpretation, LogEntry, RunResult, Source, Variant } from './types';
 
 const AGENT_TAG: Record<AgentName, string> = {
@@ -53,6 +54,8 @@ export default function App() {
   const [refining, setRefining] = useState(false);
   const [interps, setInterps] = useState<Interpretation[] | null>(null);
   const [rawTopic, setRawTopic] = useState('');
+  const [activeTab, setActiveTab] = useState(0);
+  const [copied, setCopied] = useState<string | null>(null);
   const logId = useRef(0);
   const runToken = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -339,6 +342,40 @@ export default function App() {
     if (result) void navigator.clipboard.writeText(JSON.stringify(result, null, 2));
   };
 
+  // Reset the active tab whenever a new result loads (results are shown for live/example/history/repo).
+  useEffect(() => setActiveTab(0), [result]);
+
+  const flashCopied = (which: string) => {
+    setCopied(which);
+    setTimeout(() => setCopied((c) => (c === which ? null : c)), 1500);
+  };
+
+  const downloadAdr = () => {
+    if (!result) return;
+    const blob = new Blob([buildAdrMarkdown(result)], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = adrFilename(result);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const copyAdr = () => {
+    if (!result) return;
+    void navigator.clipboard.writeText(buildAdrMarkdown(result));
+    flashCopied('adr');
+  };
+
+  const copyAgentPrompt = () => {
+    if (!result) return;
+    const variantIndex = activeTab < result.variants.length ? activeTab : 0;
+    void navigator.clipboard.writeText(buildAgentPrompt(result, variantIndex));
+    flashCopied('prompt');
+  };
+
   return (
     <div className="frame">
       <header className="masthead">
@@ -440,7 +477,7 @@ export default function App() {
                 ))}
               </div>
             )}
-            <Results result={result} />
+            <Results result={result} active={activeTab} onActive={setActiveTab} />
             <form
               className="refine-bar"
               onSubmit={(e) => { e.preventDefault(); runRefine(refineInput); }}
@@ -457,6 +494,12 @@ export default function App() {
                 {refining ? 'Refining…' : 'Refine'}
               </button>
             </form>
+            <div className="export-row">
+              <span className="demo-label">Take it with you:</span>
+              <button className="chip chip-btn" onClick={downloadAdr}>⬇ Download ADR (.md)</button>
+              <button className="chip chip-btn" onClick={copyAdr}>{copied === 'adr' ? 'Copied ✓' : '📋 Copy ADR'}</button>
+              <button className="chip chip-btn" onClick={copyAgentPrompt}>{copied === 'prompt' ? 'Copied ✓' : '📋 Copy agent prompt'}</button>
+            </div>
           </div>
         )}
         {!logs.length && (

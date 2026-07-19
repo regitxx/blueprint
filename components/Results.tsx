@@ -2,6 +2,12 @@ import mermaid from 'mermaid';
 import { useEffect, useRef, useState } from 'react';
 import type { RunResult, Source, Variant } from '../types';
 
+interface ResultsProps {
+  result: RunResult;
+  active: number;
+  onActive: (i: number) => void;
+}
+
 mermaid.initialize({
   startOnLoad: false,
   theme: 'base',
@@ -105,10 +111,8 @@ function VariantSheet({ v, index, total, sources }: { v: Variant; index: number;
   );
 }
 
-export default function Results({ result }: { result: RunResult }) {
+export default function Results({ result, active, onActive }: ResultsProps) {
   const tabs = [...result.variants.map((v) => v.name), 'Compare', 'Sources'];
-  const [active, setActive] = useState(0);
-  useEffect(() => setActive(0), [result]);
 
   return (
     <section className="results" aria-live="polite">
@@ -119,7 +123,7 @@ export default function Results({ result }: { result: RunResult }) {
             role="tab"
             aria-selected={active === i}
             className={active === i ? 'tab tab-on' : 'tab'}
-            onClick={() => setActive(i)}
+            onClick={() => onActive(i)}
           >
             {i < result.variants.length ? `${String(i + 1).padStart(2, '0')} ${t}` : t}
           </button>

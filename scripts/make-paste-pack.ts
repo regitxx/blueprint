@@ -21,6 +21,7 @@ const BROWSER_FILES = [
   'constants.ts',
   'services/sources.ts',
   'services/repo.ts',
+  'services/export.ts',
   'services/gemini.ts',
   'components/Results.tsx',
   'App.tsx',
