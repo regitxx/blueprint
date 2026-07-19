@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "scripts": { "dev": "node server.mjs", "build": "vite build", "start": "node server.mjs", "typecheck": "tsc --noEmit", "smoke": "tsx scripts/smoke.ts", "pipeline": "node --env-file-if-exists=.env --import tsx scripts/pipeline-smoke.ts", "examples": "node --env-file-if-exists=.env --import tsx scripts/generate-examples.ts", "pastepack": "tsx scripts/make-paste-pack.ts", "promptpack": "tsx scripts/make-prompt-pack.ts" },
+  "scripts": { "dev": "node server.mjs", "build": "vite build", "start": "node server.mjs", "typecheck": "tsc --noEmit", "smoke": "tsx scripts/smoke.ts", "pipeline": "node --env-file-if-exists=.env --import tsx scripts/pipeline-smoke.ts", "examples": "node --env-file-if-exists=.env --import tsx scripts/generate-examples.ts", "pastepack": "tsx scripts/make-paste-pack.ts", "promptpack": "tsx scripts/make-prompt-pack.ts", "androidprompts": "tsx scripts/make-android-prompts.ts" },
   "dependencies": {
     "@google/genai": "^1.16.0",
     "mermaid": "^11.4.0",
