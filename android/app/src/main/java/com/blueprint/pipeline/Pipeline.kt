@@ -12,6 +12,7 @@ import com.blueprint.model.Variant
 import com.blueprint.net.GeminiClient
 import com.blueprint.net.Sources
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.flow
 import kotlinx.serialization.Serializable
 
@@ -27,6 +28,7 @@ sealed interface PipelineEvent {
  * The three-agent research sprint, ported from services/gemini.ts:
  * Scout drafts queries → live arXiv/GitHub rails gather sources → Analyst extracts insights →
  * Architect drafts cited variants + a trade-off table. Every step streams a console line.
+ * The Reader agent front-runs the pipeline when the input is an uploaded idea document.
  */
 class Pipeline(
     private val gemini: GeminiClient,
@@ -47,10 +49,57 @@ class Pipeline(
         val comparison: List<ComparisonRow> = emptyList(),
     )
 
+    @Serializable
+    private data class ReaderOut(
+        val topic: String = "",
+        val constraints: List<String> = emptyList(),
+        val nonGoals: List<String> = emptyList(),
+    )
+
     private val json get() = GeminiClient.lenient
 
+    /** Run from a typed idea. */
     fun run(topic: String): Flow<PipelineEvent> = flow {
-        var nextId = 0
+        runCore(topic, constraints = null, docName = null, startId = 0)
+    }
+
+    /** Run from an uploaded idea document: Reader distills it, then the normal pipeline runs. */
+    fun runFromDoc(docName: String, text: String): Flow<PipelineEvent> = flow {
+        var id = 0
+        val readId = id++
+        emit(PipelineEvent.Log(LogEntry(readId, AgentName.READER, "Reading $docName", LogStatus.RUN)))
+        val reader = try {
+            json.decodeFromString(
+                ReaderOut.serializer(),
+                gemini.generateJson(
+                    Prompts.READER,
+                    "Document:\n${text.take(6000)}\n\nReturn JSON {\"topic\": string, " +
+                        "\"constraints\": string[], \"nonGoals\": string[]}.",
+                ),
+            )
+        } catch (e: Exception) {
+            emit(PipelineEvent.Update(readId, LogStatus.ERR))
+            emit(PipelineEvent.Failed(e.message ?: "Could not read document"))
+            return@flow
+        }
+        emit(PipelineEvent.Update(readId, LogStatus.OK))
+        val topic = reader.topic.ifBlank { docName }
+        emit(PipelineEvent.Log(LogEntry(id++, AgentName.READER, "Topic: $topic", LogStatus.OK)))
+        if (reader.constraints.isNotEmpty()) {
+            emit(PipelineEvent.Log(LogEntry(id++, AgentName.READER,
+                "${reader.constraints.size} constraint(s) distilled", LogStatus.OK)))
+        }
+        runCore(topic, reader.constraints.ifEmpty { null }, docName, id)
+    }
+
+    /** Shared Scout → Sources → Analyst → Architect core, emitting into the given collector. */
+    private suspend fun FlowCollector<PipelineEvent>.runCore(
+        topic: String,
+        constraints: List<String>?,
+        docName: String?,
+        startId: Int,
+    ) {
+        var nextId = startId
         suspend fun log(agent: AgentName, text: String): Int {
             val id = nextId++
             emit(PipelineEvent.Log(LogEntry(id, agent, text, LogStatus.RUN)))
@@ -91,7 +140,7 @@ class Pipeline(
             if (deduped.isEmpty()) {
                 err(srcId)
                 emit(PipelineEvent.Failed("No live sources found for \"$topic\". Try a broader idea or check connectivity."))
-                return@flow
+                return
             }
             emit(PipelineEvent.Log(LogEntry(nextId++, AgentName.SCOUT, "Found ${deduped.size} sources", LogStatus.OK)))
             ok(srcId)
@@ -118,11 +167,14 @@ class Pipeline(
                     "limits: ${i.limitations}; metrics: ${i.metrics}; relevance: ${i.relevance}"
             }
             val validIds = deduped.joinToString(", ") { it.id }
+            val constraintLine = constraints?.takeIf { it.isNotEmpty() }
+                ?.let { "Hard constraints to satisfy: ${it.joinToString("; ")}\n\n" }.orEmpty()
             val architect = json.decodeFromString(
                 ArchitectOut.serializer(),
                 gemini.generateJson(
                     Prompts.ARCHITECT,
-                    "User idea: $topic\n\nSource insights (cite ONLY these sourceIds: $validIds):\n$insightText\n\n" +
+                    "User idea: $topic\n\n$constraintLine" +
+                        "Source insights (cite ONLY these sourceIds: $validIds):\n$insightText\n\n" +
                         "Return JSON {\"variants\": [{\"id\", \"name\", \"profile\", \"tagline\", \"summary\", " +
                         "\"mermaid\", \"components\": [{\"name\", \"role\", \"sourceIds\": string[]}], \"risks\", " +
                         "\"whenToChoose\"}], \"comparison\": [{\"criterion\", \"values\": string[]}]}.",
@@ -138,6 +190,8 @@ class Pipeline(
                         insights = analyst.insights,
                         variants = architect.variants,
                         comparison = architect.comparison,
+                        constraints = constraints,
+                        docName = docName,
                     )
                 )
             )

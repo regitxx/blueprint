@@ -1,5 +1,8 @@
 package com.blueprint.ui
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -25,6 +28,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
@@ -52,9 +56,19 @@ fun HomeScreen(
     exampleTopics: List<String>,
     hasKey: Boolean,
     onDraft: (String) -> Unit,
+    onPickDoc: (Uri) -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     var topic by remember { mutableStateOf("") }
+    val docPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(onPickDoc)
+    }
+    val docMimeTypes = arrayOf(
+        "text/plain",
+        "text/markdown",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/octet-stream", // some .md files report this
+    )
 
     Column(
         Modifier
@@ -106,6 +120,16 @@ fun HomeScreen(
             colors = ButtonDefaults.buttonColors(containerColor = BpCyan, contentColor = BpBg),
         ) {
             Text("DRAFT IT", style = MaterialTheme.typography.labelLarge)
+        }
+
+        Spacer(Modifier.height(10.dp))
+        OutlinedButton(
+            onClick = { docPicker.launch(docMimeTypes) },
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            shape = RoundedCornerShape(8.dp),
+        ) {
+            Text("UPLOAD IDEA DOC  ·  .txt .md .docx",
+                style = MaterialTheme.typography.labelLarge, color = BpCyan)
         }
 
         if (!hasKey) {

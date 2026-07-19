@@ -70,6 +70,10 @@ private fun BlueprintApp(modifier: Modifier = Modifier) {
                     vm.startRun(topic)
                     nav.navigate(Routes.RUN)
                 },
+                onPickDoc = { uri ->
+                    vm.startFromDocUri(uri)
+                    nav.navigate(Routes.RUN)
+                },
                 onOpenSettings = { nav.navigate(Routes.SETTINGS) },
             )
         }

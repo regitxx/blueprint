@@ -75,9 +75,32 @@ fun ResultsScreen(
             Column(Modifier.weight(1f)) {
                 SectionLabel("Blueprint")
                 Text(result.topic, style = MaterialTheme.typography.titleMedium, color = BpInk)
+                result.docName?.let {
+                    Text("from $it", style = MaterialTheme.typography.labelSmall, color = BpDim)
+                }
             }
             Text("NEW", style = MaterialTheme.typography.labelLarge, color = BpCyan,
                 modifier = Modifier.clickable(onClick = onNewRun).padding(6.dp))
+        }
+
+        // Distilled hard constraints from an uploaded idea doc, if any.
+        if (!result.constraints.isNullOrEmpty()) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 8.dp)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                result.constraints.forEach { c ->
+                    Box(
+                        Modifier.clip(RoundedCornerShape(4.dp))
+                            .border(1.dp, BpAmber.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
+                            .background(BpAmber.copy(alpha = 0.08f))
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                    ) {
+                        Text(c, style = MaterialTheme.typography.labelSmall, color = BpAmber)
+                    }
+                }
+            }
         }
 
         // Page indicator

@@ -1,8 +1,10 @@
 package com.blueprint
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.blueprint.data.DocReader
 import com.blueprint.data.SeedData
 import com.blueprint.model.AgentName
 import com.blueprint.model.LogEntry
@@ -13,12 +15,14 @@ import com.blueprint.net.Sources
 import com.blueprint.pipeline.Pipeline
 import com.blueprint.pipeline.PipelineEvent
 import com.blueprint.settings.KeyStore
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class RunPhase { IDLE, RUNNING, DONE, ERROR }
 
@@ -46,20 +50,40 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refreshKeyStatus() = _state.update { it.copy(hasKey = keyStore.hasKey()) }
 
+    // --- entry points -----------------------------------------------------
+
     fun startRun(topic: String) {
         val trimmed = topic.trim()
         if (trimmed.isEmpty() || _state.value.phase == RunPhase.RUNNING) return
+        if (!keyStore.hasKey()) { runDemo(trimmed, null); return }
+        collect(trimmed, pipeline.run(trimmed))
+    }
 
-        if (!keyStore.hasKey()) {
-            runDemo(trimmed)
-            return
+    fun startFromDocUri(uri: Uri) {
+        if (_state.value.phase == RunPhase.RUNNING) return
+        _state.update { it.copy(topic = "Reading document…", logs = emptyList(), result = null,
+            error = null, phase = RunPhase.RUNNING, usingDemo = false) }
+        viewModelScope.launch {
+            val doc = withContext(Dispatchers.IO) {
+                runCatching { DocReader.read(getApplication(), uri) }.getOrNull()
+            }
+            if (doc == null || doc.text.isBlank()) {
+                _state.update { it.copy(phase = RunPhase.ERROR, error = "Could not read that file. Use a .txt, .md, or .docx with text.") }
+                return@launch
+            }
+            if (!keyStore.hasKey()) { runDemo(doc.name, doc.name); return@launch }
+            collect(doc.name, pipeline.runFromDoc(doc.name, doc.text))
         }
+    }
+
+    /** Shared collector for both typed and document runs. */
+    private fun collect(topic: String, flow: Flow<PipelineEvent>) {
         _state.update {
-            it.copy(topic = trimmed, logs = emptyList(), result = null, error = null,
+            it.copy(topic = topic, logs = emptyList(), result = null, error = null,
                 phase = RunPhase.RUNNING, usingDemo = false)
         }
         viewModelScope.launch {
-            pipeline.run(trimmed).collect { ev ->
+            flow.collect { ev ->
                 when (ev) {
                     is PipelineEvent.Log -> _state.update { it.copy(logs = it.logs + ev.entry) }
                     is PipelineEvent.Update -> _state.update { st ->
@@ -73,28 +97,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** No-key demo: scripted console animation, then the seeded sample run. */
-    private fun runDemo(topic: String) {
+    private fun runDemo(topic: String, docName: String?) {
         _state.update {
             it.copy(topic = topic, logs = emptyList(), result = null, error = null,
                 phase = RunPhase.RUNNING, usingDemo = true)
         }
         viewModelScope.launch {
-            val script = listOf(
-                AgentName.SYSTEM to "Demo mode · no API key set",
-                AgentName.SCOUT to "Drafting search queries",
-                AgentName.SCOUT to "Searching arXiv + GitHub",
-                AgentName.ANALYST to "Reading sources",
-                AgentName.ARCHITECT to "Drafting architecture variants",
-            )
+            val script = buildList {
+                add(AgentName.SYSTEM to "Demo mode · no API key set")
+                if (docName != null) add(AgentName.READER to "Reading $docName")
+                add(AgentName.SCOUT to "Drafting search queries")
+                add(AgentName.SCOUT to "Searching arXiv + GitHub")
+                add(AgentName.ANALYST to "Reading sources")
+                add(AgentName.ARCHITECT to "Drafting architecture variants")
+            }
             script.forEachIndexed { i, (agent, text) ->
-                val entry = LogEntry(i, agent, text, LogStatus.RUN)
-                _state.update { it.copy(logs = it.logs + entry) }
-                delay(650)
+                _state.update { it.copy(logs = it.logs + LogEntry(i, agent, text, LogStatus.RUN)) }
+                kotlinx.coroutines.delay(600)
                 _state.update { st ->
                     st.copy(logs = st.logs.map { if (it.id == i) it.copy(status = LogStatus.OK) else it })
                 }
             }
-            _state.update { it.copy(result = SeedData.SAMPLE, phase = RunPhase.DONE) }
+            val sample = if (docName != null) SeedData.SAMPLE.copy(docName = docName) else SeedData.SAMPLE
+            _state.update { it.copy(result = sample, phase = RunPhase.DONE) }
         }
     }
 
@@ -102,7 +127,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val current = _state.value.result ?: return
         if (instruction.isBlank() || _state.value.refining) return
         if (_state.value.usingDemo || !keyStore.hasKey()) {
-            // Demo mode can't call the model; surface it plainly rather than faking a change.
             _state.update { it.copy(error = "Set a Gemini API key in Settings to refine live.") }
             return
         }
@@ -114,9 +138,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun reset() = _state.update {
-        UiState(hasKey = keyStore.hasKey())
-    }
+    fun reset() = _state.update { UiState(hasKey = keyStore.hasKey()) }
 
     // --- settings ---------------------------------------------------------
     fun currentRuntimeKey() = keyStore.runtimeKey()
