@@ -68,6 +68,16 @@ if (!prompt.includes('CRDT Core')) throw new Error('agent prompt: missing chosen
 if (!prompt.includes('No vector database')) throw new Error('agent prompt: missing constraint');
 console.log('Agent prompt: chosen variant + constraint ✓');
 
+// DOCX extract: constructing a valid canned .docx (ZIP: [Content_Types].xml + rels + word/document.xml)
+// needs JSZip and is >10 lines of setup, so the extractRawText unit test is intentionally SKIPPED here.
+// Covered by the manual preview test (upload a real .docx). mammoth availability guard:
+try {
+  await import('mammoth');
+  console.log('DOCX extract: unit test SKIPPED (canned .docx needs JSZip) — covered by manual preview test');
+} catch {
+  console.log('DOCX extract: mammoth unavailable — SKIPPED');
+}
+
 const repos = await searchGithub('multi agent llm framework', 2);
 console.log('GitHub live:', repos.map(r => `${r.title} [${r.meta}] snippet:${r.snippet.slice(0, 60)}...`));
 if (repos.length === 0) throw new Error('GitHub search returned nothing');

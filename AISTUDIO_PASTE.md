@@ -34,7 +34,8 @@
     "react/jsx-runtime": "https://esm.sh/react@19.1.0/jsx-runtime",
     "react-dom/client": "https://esm.sh/react-dom@19.1.0/client",
     "@google/genai": "https://esm.sh/@google/genai@1.16.0",
-    "mermaid": "https://esm.sh/mermaid@11.4.0"
+    "mermaid": "https://esm.sh/mermaid@11.4.0",
+    "mammoth": "https://esm.sh/mammoth@1.8.0"
   }
 }
 </script>
@@ -898,7 +899,7 @@ export const ARCHITECT_SYSTEM = `You are Architect, a pragmatic systems designer
 
 Mermaid rules (strict): output "flowchart TD" only; node ids A, B, C...; every label in double quotes; no parentheses, brackets, semicolons or the word "end" inside labels; max 12 nodes; edges may have short labels. Example: A["User"] -->|"idea"| B["Scout agent"].
 
-Also produce a comparison table: 5-6 criteria rows (e.g. time to MVP, scaling ceiling, consistency/quality, cost per query, ops complexity, defensibility), values aligned to the variants order, each value under 8 words. The table MUST include a row with criterion exactly "Rough monthly cost (cloud + LLM)" whose values are order-of-magnitude estimates like "~$20/mo", "~$200/mo", "~$2k/mo" — clearly rough, derived from that variant's architecture (compute + storage + LLM/API calls). Output JSON only. When a component is an LLM, VLM, or embedding service, name it generically (e.g. "vision-language model API") or as Gemini; name a specific third-party model only if a cited source is specifically about that model. Prefer 3 variants when the sources support three distinct profiles.`;
+Also produce a comparison table: 5-6 criteria rows (e.g. time to MVP, scaling ceiling, consistency/quality, cost per query, ops complexity, defensibility), values aligned to the variants order, each value under 8 words. The table MUST include a row with criterion exactly "Rough monthly cost (cloud + LLM)" whose values are order-of-magnitude estimates like "~$20/mo", "~$200/mo", "~$2k/mo" — clearly rough, derived from that variant's architecture (compute + storage + LLM/API calls). Output JSON only. When a component is an LLM, VLM, or embedding service, name it generically (e.g. "vision-language model API") or as Gemini; name a specific third-party model only if a cited source is specifically about that model. Prefer 3 variants when the sources support three distinct profiles. If the sources reveal a materially better product or architecture direction than the user's framing, you may make ONE variant a challenger: prefix its tagline with "Challenger take — " and state in whenToChoose which assumption it questions. Never more than one; citations, cost row, mermaid rules unchanged.`;
 
 // Refine mode reuses every ARCHITECT_SYSTEM rule (mermaid, citations, cost row) and adds the
 // revise-in-place instruction, so refined output stays schema- and citation-compliant.
@@ -1995,6 +1996,15 @@ function readFileText(file: File): Promise<string> {
   });
 }
 
+function readFileArrayBuffer(file: File): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result as ArrayBuffer);
+    fr.onerror = () => reject(fr.error ?? new Error('file read failed'));
+    fr.readAsArrayBuffer(file);
+  });
+}
+
 // Run history — last 5 successful live runs, newest first, persisted in localStorage.
 const HISTORY_KEY = 'bp.history';
 interface HistoryEntry { topic: string; savedAt: number; result: RunResult; }
@@ -2244,7 +2254,28 @@ export default function App() {
     }
     const token = begin(file.name);
     try {
-      const text = await readFileText(file);
+      let text: string;
+      if (/\.docx$/i.test(file.name)) {
+        // Lazy import so mammoth stays out of the initial bundle; a CDN failure only breaks docx.
+        try {
+          const arrayBuffer = await readFileArrayBuffer(file);
+          const mod: any = await import('mammoth');
+          const mammoth = mod.default ?? mod;
+          const { value } = await mammoth.extractRawText({ arrayBuffer });
+          text = value;
+          if (runToken.current !== token) return;
+          const cw = text.trim() ? text.trim().split(/\s+/).length : 0;
+          log('reader', `Converted ${file.name}: ${cw} words`, 'ok');
+        } catch {
+          if (runToken.current !== token) return;
+          log('reader', "Couldn't read .docx — paste the text instead", 'err');
+          setError("Couldn't read .docx — paste the text instead.");
+          setPhase('error');
+          return;
+        }
+      } else {
+        text = await readFileText(file);
+      }
       const words = text.trim() ? text.trim().split(/\s+/).length : 0;
       const rid = log('reader', `Reading ${file.name}: ${words} words…`);
       const { topic: distilled, constraints } = await readDocument(text);
@@ -2375,7 +2406,7 @@ export default function App() {
           <input
             ref={fileRef}
             type="file"
-            accept=".txt,.md,text/plain,text/markdown"
+            accept=".txt,.md,text/plain,text/markdown,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             hidden
             onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleDoc(f); e.target.value = ''; }}
           />
