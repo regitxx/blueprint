@@ -1,0 +1,9 @@
+# Copy to local.properties (which is gitignored) and fill in.
+# Android Studio / AI Studio normally sets sdk.dir automatically.
+
+# Path to your Android SDK, e.g.:
+# sdk.dir=/Users/you/Library/Android/sdk
+
+# Optional build-time Gemini key. Leave empty to enter the key at runtime in the app's
+# Settings screen instead. Get one at https://aistudio.google.com/apikey
+GEMINI_API_KEY=

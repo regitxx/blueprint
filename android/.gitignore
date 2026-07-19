@@ -1,0 +1,14 @@
+# Android / Gradle build outputs
+.gradle/
+build/
+app/build/
+captures/
+.cxx/
+
+# Local config & secrets — never commit
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base theme is applied before Compose takes over; keeps the splash/system bars on-brand. -->
+    <style name="Theme.Blueprint" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@color/bp_bg</item>
+        <item name="android:navigationBarColor">@color/bp_bg</item>
+        <item name="android:windowBackground">@color/bp_bg</item>
+    </style>
+</resources>

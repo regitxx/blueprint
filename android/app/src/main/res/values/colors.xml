@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Blueprint dark drafting-paper palette (mirrors the web app / ANDROID_PROMPTS spec). -->
+    <color name="bp_bg">#FF0E1D33</color>
+    <color name="bp_surface">#FF12253F</color>
+    <color name="bp_ink">#FFDCE9F7</color>
+    <color name="bp_dim">#FF8FA9C9</color>
+    <color name="bp_line">#FF2B4A73</color>
+    <color name="bp_cyan">#FF5FD4F5</color>
+    <color name="bp_amber">#FFF5B95F</color>
+</resources>
