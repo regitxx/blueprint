@@ -1,13 +1,13 @@
 import { useCallback, useRef, useState } from 'react';
 import Results from './components/Results';
 import { CACHED_RUNS } from './constants';
-import { analyzeSources, mapRepoArchitecture, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
+import { analyzeSources, interpretIdea, mapRepoArchitecture, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
 import { gatherSources } from './services/sources';
 import { fetchRepoSkeleton } from './services/repo';
-import type { AgentName, LogEntry, RunResult, Source, Variant } from './types';
+import type { AgentName, Interpretation, LogEntry, RunResult, Source, Variant } from './types';
 
 const AGENT_TAG: Record<AgentName, string> = {
-  scout: 'SCT', analyst: 'ANL', architect: 'ARC', reader: 'RDR', cartographer: 'MAP', system: 'SYS',
+  scout: 'SCT', analyst: 'ANL', architect: 'ARC', reader: 'RDR', cartographer: 'MAP', interpreter: 'INT', system: 'SYS',
 };
 
 const REPO_RE = /github\.com\/([\w.-]+)\/([\w.-]+)/;
@@ -51,6 +51,8 @@ export default function App() {
   const [history, setHistory] = useState<HistoryEntry[]>(() => loadHistory());
   const [refineInput, setRefineInput] = useState('');
   const [refining, setRefining] = useState(false);
+  const [interps, setInterps] = useState<Interpretation[] | null>(null);
+  const [rawTopic, setRawTopic] = useState('');
   const logId = useRef(0);
   const runToken = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -74,13 +76,14 @@ export default function App() {
     setResult(null);
     setError('');
     setLogs([]);
+    setInterps(null); // any fresh run clears the interpretation cards
     setPhase('running');
     return runToken.current;
   };
 
   // Core Scout → Analyst → Architect pipeline. Shared by the plain "Draft it" flow and the
   // document-reader flow (which supplies distilled constraints + the doc name).
-  async function executePipeline(token: number, t: string, extra?: { constraints?: string[]; docName?: string }) {
+  async function executePipeline(token: number, t: string, extra?: { constraints?: string[]; docName?: string; chosenInterpretation?: string }) {
     try {
       let id = log('scout', `Reading the idea: “${t}”`);
       const queries = await scoutQueries(t);
@@ -105,7 +108,7 @@ export default function App() {
       log('system', 'Blueprint ready. Every block links to a source.', 'ok');
 
       if (runToken.current !== token) return;
-      const run: RunResult = { topic: t, sources, insights, variants, comparison, constraints: extra?.constraints, docName: extra?.docName };
+      const run: RunResult = { topic: t, sources, insights, variants, comparison, constraints: extra?.constraints, docName: extra?.docName, chosenInterpretation: extra?.chosenInterpretation };
       setResult(run);
       setPhase('done');
       setHistory(pushHistory({ topic: t, savedAt: Date.now(), result: run }));
@@ -122,8 +125,8 @@ export default function App() {
     }
   }
 
-  async function runLive(rawTopic: string) {
-    const t = rawTopic.trim();
+  async function runLive(rawIdea: string) {
+    const t = rawIdea.trim();
     if (!t || busy) return;
     const repoMatch = t.match(REPO_RE);
     const token = begin(t);
@@ -131,9 +134,44 @@ export default function App() {
       const owner = repoMatch[1];
       const repo = repoMatch[2].replace(/\.git$/, '');
       await runRepoAnalysis(token, owner, repo, t);
-    } else {
+      return;
+    }
+    // Plain-idea path: ambiguity gate before committing to research.
+    const gateId = log('interpreter', 'Checking for ambiguity…');
+    try {
+      const { ambiguous, interpretations } = await interpretIdea(t);
+      if (runToken.current !== token) return;
+      settle(gateId, 'ok');
+      if (!ambiguous || interpretations.length === 0) {
+        log('interpreter', 'Idea is specific — proceeding ✓', 'ok');
+        await executePipeline(token, t);
+      } else {
+        log('interpreter', `This idea forks ${interpretations.length} ways — pick one below`, 'ok');
+        setRawTopic(t);
+        setInterps(interpretations);
+        setPhase('idle'); // pause for the user to choose an interpretation
+      }
+    } catch {
+      // Gate is non-critical — if it fails, don't block; research the idea as written.
+      if (runToken.current !== token) return;
+      settle(gateId, 'err');
       await executePipeline(token, t);
     }
+  }
+
+  // A user picked one fork: research it under that reading's name + implied constraints.
+  async function chooseInterpretation(interp: Interpretation) {
+    if (busy) return;
+    const topic = `${interp.name} — ${interp.oneLiner}`;
+    const token = begin(topic); // clears the cards
+    await executePipeline(token, topic, { constraints: interp.impliedConstraints, chosenInterpretation: interp.name });
+  }
+
+  // Or the user rejects the forks and researches their exact wording.
+  async function researchExactWording() {
+    if (busy || !rawTopic) return;
+    const token = begin(rawTopic);
+    await executePipeline(token, rawTopic);
   }
 
   // Cartographer flow: repo URL → as-built sheet 0 → seeded research → evolution variants.
@@ -356,6 +394,23 @@ export default function App() {
         )}
         {error && <p className="error" role="alert">{error}</p>}
       </section>
+
+      {interps && interps.length > 0 && (
+        <div className="interp-grid" role="group" aria-label="Pick an interpretation">
+          {interps.map((it) => (
+            <button key={it.id} className="interp-card" onClick={() => chooseInterpretation(it)} disabled={busy}>
+              <span className="interp-name">{it.name}</span>
+              <span className="interp-one">{it.oneLiner}</span>
+              <span className="interp-diff">{it.keyDifference}</span>
+              <span className="interp-user">{it.exampleUser}</span>
+            </button>
+          ))}
+          <button className="interp-card interp-exact" onClick={researchExactWording} disabled={busy}>
+            <span className="interp-name">→ Research my exact wording</span>
+            <span className="interp-one">Skip the fork and research “{rawTopic}” as written.</span>
+          </button>
+        </div>
+      )}
 
       <main className={logs.length ? 'workbench' : 'workbench empty'}>
         {logs.length > 0 && (

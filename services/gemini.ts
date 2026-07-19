@@ -1,6 +1,6 @@
 import { GoogleGenAI, Type } from '@google/genai';
-import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, CARTOGRAPHER_SYSTEM, MODEL, READER_SYSTEM, SCOUT_SYSTEM } from '../constants';
-import type { ComparisonRow, Insight, Source, Variant } from '../types';
+import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, CARTOGRAPHER_SYSTEM, INTERPRETER_SYSTEM, MODEL, READER_SYSTEM, SCOUT_SYSTEM } from '../constants';
+import type { ComparisonRow, Insight, Interpretation, Source, Variant } from '../types';
 import type { RepoSkeleton } from './repo';
 
 function getApiKey(): string {
@@ -47,6 +47,51 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
       await new Promise((r) => setTimeout(r, wait));
     }
   }
+}
+
+// ---------------- 0a · Interpreter (ambiguity gate) ----------------
+
+export interface Interpretations {
+  ambiguous: boolean;
+  interpretations: Interpretation[];
+}
+
+export async function interpretIdea(topic: string): Promise<Interpretations> {
+  const res = await withRetry(() => ai().models.generateContent({
+    model: MODEL,
+    contents: `Product idea: "${topic}". Decide whether it is ambiguous and, if so, enumerate the distinct readings.`,
+    config: {
+      systemInstruction: INTERPRETER_SYSTEM,
+      responseMimeType: 'application/json',
+      thinkingConfig: { thinkingLevel: 'low' } as any, // fast pre-research gate; low reasoning cuts latency
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          ambiguous: { type: Type.BOOLEAN },
+          interpretations: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                name: { type: Type.STRING, description: '≤6 words' },
+                oneLiner: { type: Type.STRING },
+                keyDifference: { type: Type.STRING, description: 'what this reading INCLUDES that others EXCLUDE' },
+                exampleUser: { type: Type.STRING },
+                impliedConstraints: { type: Type.ARRAY, items: { type: Type.STRING }, description: '≤3 imperatives' },
+              },
+              required: ['name', 'oneLiner', 'keyDifference', 'exampleUser', 'impliedConstraints'],
+            },
+          },
+        },
+        required: ['ambiguous', 'interpretations'],
+      },
+    },
+  }));
+  const parsed = parseJson<{ ambiguous: boolean; interpretations: Omit<Interpretation, 'id'>[] }>(res.text, 'Interpreter');
+  return {
+    ambiguous: parsed.ambiguous,
+    interpretations: (parsed.interpretations ?? []).map((it, i) => ({ ...it, id: `i${i + 1}` })),
+  };
 }
 
 // ---------------- 0 · Reader (optional idea-doc → topic + constraints) ----------------

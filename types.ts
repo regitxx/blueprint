@@ -1,4 +1,13 @@
-export type AgentName = 'scout' | 'analyst' | 'architect' | 'reader' | 'cartographer' | 'system';
+export type AgentName = 'scout' | 'analyst' | 'architect' | 'reader' | 'cartographer' | 'interpreter' | 'system';
+
+export interface Interpretation {
+  id: string;
+  name: string;
+  oneLiner: string;
+  keyDifference: string; // what this reading INCLUDES that the others EXCLUDE
+  exampleUser: string;
+  impliedConstraints: string[]; // ≤3 imperatives
+}
 
 export interface LogEntry {
   id: number;
@@ -58,4 +67,5 @@ export interface RunResult {
   constraints?: string[]; // hard constraints distilled from an uploaded idea doc
   docName?: string; // filename of the uploaded idea doc, if any
   repoUrl?: string; // github.com/owner/repo, when the run started from a repo URL
+  chosenInterpretation?: string; // interpretation name, when a vague idea was disambiguated
 }

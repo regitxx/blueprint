@@ -100,6 +100,20 @@
   .refine-btn { font-size: 14px; padding: 0 22px; }
   .constraint-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 16px; }
   .constraint-chip { color: var(--amber); border: 1px solid var(--amber); background: rgba(245,185,95,.08); }
+  .interp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-top: 22px; }
+  .interp-card {
+    display: flex; flex-direction: column; gap: 8px; text-align: left; cursor: pointer;
+    background: var(--paper-2); border: 1px solid var(--line); border-radius: 2px; padding: 16px 16px 18px;
+    transition: border-color .12s ease;
+  }
+  .interp-card:hover:enabled { border-color: var(--cyan); }
+  .interp-card:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+  .interp-card:disabled { opacity: .5; cursor: default; }
+  .interp-name { font-family: var(--display); font-weight: 700; font-size: 16px; color: var(--ink); }
+  .interp-one { font-family: var(--body); font-size: 14px; color: var(--ink); }
+  .interp-diff { font-family: var(--body); font-size: 13.5px; color: var(--amber); font-style: italic; border-left: 2px solid var(--amber); padding-left: 10px; }
+  .interp-user { font-family: var(--mono); font-size: 11.5px; color: var(--ink-dim); }
+  .interp-exact { border-style: dashed; }
   .demo-row { margin-top: 12px; align-items: center; }
   .demo-label { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); margin-right: 4px; }
   .error { color: var(--err); margin: 10px 0 0; }
@@ -123,6 +137,7 @@
   .tag-architect { color: #9FF5C0; border-color: #9FF5C0; }
   .tag-reader { color: #C9A7F5; border-color: #C9A7F5; }
   .tag-cartographer { color: #7FE0D6; border-color: #7FE0D6; }
+  .tag-interpreter { color: #F5D95F; border-color: #F5D95F; }
   .log-text { flex: 1; }
   .log-dot { color: var(--ink-dim); }
   .log-ok .log-dot { color: var(--cyan); }
@@ -211,7 +226,16 @@
 ## 3. types.ts
 
 ```ts
-export type AgentName = 'scout' | 'analyst' | 'architect' | 'reader' | 'cartographer' | 'system';
+export type AgentName = 'scout' | 'analyst' | 'architect' | 'reader' | 'cartographer' | 'interpreter' | 'system';
+
+export interface Interpretation {
+  id: string;
+  name: string;
+  oneLiner: string;
+  keyDifference: string; // what this reading INCLUDES that the others EXCLUDE
+  exampleUser: string;
+  impliedConstraints: string[]; // ≤3 imperatives
+}
 
 export interface LogEntry {
   id: number;
@@ -271,6 +295,7 @@ export interface RunResult {
   constraints?: string[]; // hard constraints distilled from an uploaded idea doc
   docName?: string; // filename of the uploaded idea doc, if any
   repoUrl?: string; // github.com/owner/repo, when the run started from a repo URL
+  chosenInterpretation?: string; // interpretation name, when a vague idea was disambiguated
 }
 ```
 
@@ -853,6 +878,8 @@ export const MODEL = (typeof process !== 'undefined' && process.env?.GEMINI_MODE
 
 export const SOURCE_LIMITS = { arxiv: 4, github: 3, total: 7 };
 
+export const INTERPRETER_SYSTEM = `You are Interpreter, a disambiguation gate. Given a product idea, decide whether it is specific enough to research unambiguously. If it is clear and points at ONE product, return {"ambiguous": false, "interpretations": []}. If it plausibly forks into materially different products, return {"ambiguous": true, "interpretations": [2-3 items]}. Each interpretation has: "name" (≤6 words), "oneLiner" (one sentence describing the product), "keyDifference" (state exactly what THIS reading INCLUDES that the others EXCLUDE), "exampleUser" (a concrete user and what they'd do with it), and "impliedConstraints" (≤3 imperatives capturing this reading's assumptions, e.g. "Must support real-time collaboration"). Mark ambiguous ONLY when the readings are materially different PRODUCTS — different users, domains, or core purpose. Do NOT fork on implementation choices (algorithm, programming language, framework, or deployment model) within the same product. If the idea already names a concrete artifact or form factor together with its function (e.g. "a Go middleware library that rate-limits REST APIs"), it is specific — return ambiguous:false. Never invent domains the idea does not support; the interpretations must be genuine, distinct readings of the SAME words. Output JSON only.`;
+
 export const CARTOGRAPHER_SYSTEM = `You are Cartographer, a reverse-engineer. You are given a repository's metadata, file tree, README, a manifest, and a few entry files. Produce ONLY what these files actually support — never invent components, files, or capabilities not evidenced by the inputs. Output JSON with: "summary" (≤2 sentences describing what the repo is and does); "detectedStack" (≤6 short strings, concrete technologies you can see, e.g. "Express", "TypeScript", "PostgreSQL"); "asBuilt" — one variant object describing the CURRENT system: { "name": "As-built — <repo>", "profile": "As-built", "tagline", "summary", "mermaid", "components": [{ "name", "role", "paths": [real file/dir paths copied verbatim from the provided tree] }], "risks" (observed weaknesses or gaps in the actual code), "whenToChoose": "This is the current system." }; and seed queries { "arxivQueries": [2 queries], "githubQueries": [2 queries] } targeting how the detected stack could evolve (scaling, robustness, next-gen techniques).
 
 Mermaid rules (strict): output "flowchart TD" only; node ids A, B, C...; every label in double quotes; no parentheses, brackets, semicolons or the word "end" inside labels; max 12 nodes; edges may have short labels.
@@ -1205,8 +1232,8 @@ export async function fetchRepoSkeleton(
 
 ````ts
 import { GoogleGenAI, Type } from '@google/genai';
-import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, CARTOGRAPHER_SYSTEM, MODEL, READER_SYSTEM, SCOUT_SYSTEM } from '../constants';
-import type { ComparisonRow, Insight, Source, Variant } from '../types';
+import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, CARTOGRAPHER_SYSTEM, INTERPRETER_SYSTEM, MODEL, READER_SYSTEM, SCOUT_SYSTEM } from '../constants';
+import type { ComparisonRow, Insight, Interpretation, Source, Variant } from '../types';
 import type { RepoSkeleton } from './repo';
 
 function getApiKey(): string {
@@ -1253,6 +1280,51 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
       await new Promise((r) => setTimeout(r, wait));
     }
   }
+}
+
+// ---------------- 0a · Interpreter (ambiguity gate) ----------------
+
+export interface Interpretations {
+  ambiguous: boolean;
+  interpretations: Interpretation[];
+}
+
+export async function interpretIdea(topic: string): Promise<Interpretations> {
+  const res = await withRetry(() => ai().models.generateContent({
+    model: MODEL,
+    contents: `Product idea: "${topic}". Decide whether it is ambiguous and, if so, enumerate the distinct readings.`,
+    config: {
+      systemInstruction: INTERPRETER_SYSTEM,
+      responseMimeType: 'application/json',
+      thinkingConfig: { thinkingLevel: 'low' } as any, // fast pre-research gate; low reasoning cuts latency
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          ambiguous: { type: Type.BOOLEAN },
+          interpretations: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                name: { type: Type.STRING, description: '≤6 words' },
+                oneLiner: { type: Type.STRING },
+                keyDifference: { type: Type.STRING, description: 'what this reading INCLUDES that others EXCLUDE' },
+                exampleUser: { type: Type.STRING },
+                impliedConstraints: { type: Type.ARRAY, items: { type: Type.STRING }, description: '≤3 imperatives' },
+              },
+              required: ['name', 'oneLiner', 'keyDifference', 'exampleUser', 'impliedConstraints'],
+            },
+          },
+        },
+        required: ['ambiguous', 'interpretations'],
+      },
+    },
+  }));
+  const parsed = parseJson<{ ambiguous: boolean; interpretations: Omit<Interpretation, 'id'>[] }>(res.text, 'Interpreter');
+  return {
+    ambiguous: parsed.ambiguous,
+    interpretations: (parsed.interpretations ?? []).map((it, i) => ({ ...it, id: `i${i + 1}` })),
+  };
 }
 
 // ---------------- 0 · Reader (optional idea-doc → topic + constraints) ----------------
@@ -1735,13 +1807,13 @@ export default function Results({ result }: { result: RunResult }) {
 import { useCallback, useRef, useState } from 'react';
 import Results from './components/Results';
 import { CACHED_RUNS } from './constants';
-import { analyzeSources, mapRepoArchitecture, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
+import { analyzeSources, interpretIdea, mapRepoArchitecture, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
 import { gatherSources } from './services/sources';
 import { fetchRepoSkeleton } from './services/repo';
-import type { AgentName, LogEntry, RunResult, Source, Variant } from './types';
+import type { AgentName, Interpretation, LogEntry, RunResult, Source, Variant } from './types';
 
 const AGENT_TAG: Record<AgentName, string> = {
-  scout: 'SCT', analyst: 'ANL', architect: 'ARC', reader: 'RDR', cartographer: 'MAP', system: 'SYS',
+  scout: 'SCT', analyst: 'ANL', architect: 'ARC', reader: 'RDR', cartographer: 'MAP', interpreter: 'INT', system: 'SYS',
 };
 
 const REPO_RE = /github\.com\/([\w.-]+)\/([\w.-]+)/;
@@ -1785,6 +1857,8 @@ export default function App() {
   const [history, setHistory] = useState<HistoryEntry[]>(() => loadHistory());
   const [refineInput, setRefineInput] = useState('');
   const [refining, setRefining] = useState(false);
+  const [interps, setInterps] = useState<Interpretation[] | null>(null);
+  const [rawTopic, setRawTopic] = useState('');
   const logId = useRef(0);
   const runToken = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -1808,13 +1882,14 @@ export default function App() {
     setResult(null);
     setError('');
     setLogs([]);
+    setInterps(null); // any fresh run clears the interpretation cards
     setPhase('running');
     return runToken.current;
   };
 
   // Core Scout → Analyst → Architect pipeline. Shared by the plain "Draft it" flow and the
   // document-reader flow (which supplies distilled constraints + the doc name).
-  async function executePipeline(token: number, t: string, extra?: { constraints?: string[]; docName?: string }) {
+  async function executePipeline(token: number, t: string, extra?: { constraints?: string[]; docName?: string; chosenInterpretation?: string }) {
     try {
       let id = log('scout', `Reading the idea: “${t}”`);
       const queries = await scoutQueries(t);
@@ -1839,7 +1914,7 @@ export default function App() {
       log('system', 'Blueprint ready. Every block links to a source.', 'ok');
 
       if (runToken.current !== token) return;
-      const run: RunResult = { topic: t, sources, insights, variants, comparison, constraints: extra?.constraints, docName: extra?.docName };
+      const run: RunResult = { topic: t, sources, insights, variants, comparison, constraints: extra?.constraints, docName: extra?.docName, chosenInterpretation: extra?.chosenInterpretation };
       setResult(run);
       setPhase('done');
       setHistory(pushHistory({ topic: t, savedAt: Date.now(), result: run }));
@@ -1856,8 +1931,8 @@ export default function App() {
     }
   }
 
-  async function runLive(rawTopic: string) {
-    const t = rawTopic.trim();
+  async function runLive(rawIdea: string) {
+    const t = rawIdea.trim();
     if (!t || busy) return;
     const repoMatch = t.match(REPO_RE);
     const token = begin(t);
@@ -1865,9 +1940,44 @@ export default function App() {
       const owner = repoMatch[1];
       const repo = repoMatch[2].replace(/\.git$/, '');
       await runRepoAnalysis(token, owner, repo, t);
-    } else {
+      return;
+    }
+    // Plain-idea path: ambiguity gate before committing to research.
+    const gateId = log('interpreter', 'Checking for ambiguity…');
+    try {
+      const { ambiguous, interpretations } = await interpretIdea(t);
+      if (runToken.current !== token) return;
+      settle(gateId, 'ok');
+      if (!ambiguous || interpretations.length === 0) {
+        log('interpreter', 'Idea is specific — proceeding ✓', 'ok');
+        await executePipeline(token, t);
+      } else {
+        log('interpreter', `This idea forks ${interpretations.length} ways — pick one below`, 'ok');
+        setRawTopic(t);
+        setInterps(interpretations);
+        setPhase('idle'); // pause for the user to choose an interpretation
+      }
+    } catch {
+      // Gate is non-critical — if it fails, don't block; research the idea as written.
+      if (runToken.current !== token) return;
+      settle(gateId, 'err');
       await executePipeline(token, t);
     }
+  }
+
+  // A user picked one fork: research it under that reading's name + implied constraints.
+  async function chooseInterpretation(interp: Interpretation) {
+    if (busy) return;
+    const topic = `${interp.name} — ${interp.oneLiner}`;
+    const token = begin(topic); // clears the cards
+    await executePipeline(token, topic, { constraints: interp.impliedConstraints, chosenInterpretation: interp.name });
+  }
+
+  // Or the user rejects the forks and researches their exact wording.
+  async function researchExactWording() {
+    if (busy || !rawTopic) return;
+    const token = begin(rawTopic);
+    await executePipeline(token, rawTopic);
   }
 
   // Cartographer flow: repo URL → as-built sheet 0 → seeded research → evolution variants.
@@ -2090,6 +2200,23 @@ export default function App() {
         )}
         {error && <p className="error" role="alert">{error}</p>}
       </section>
+
+      {interps && interps.length > 0 && (
+        <div className="interp-grid" role="group" aria-label="Pick an interpretation">
+          {interps.map((it) => (
+            <button key={it.id} className="interp-card" onClick={() => chooseInterpretation(it)} disabled={busy}>
+              <span className="interp-name">{it.name}</span>
+              <span className="interp-one">{it.oneLiner}</span>
+              <span className="interp-diff">{it.keyDifference}</span>
+              <span className="interp-user">{it.exampleUser}</span>
+            </button>
+          ))}
+          <button className="interp-card interp-exact" onClick={researchExactWording} disabled={busy}>
+            <span className="interp-name">→ Research my exact wording</span>
+            <span className="interp-one">Skip the fork and research “{rawTopic}” as written.</span>
+          </button>
+        </div>
+      )}
 
       <main className={logs.length ? 'workbench' : 'workbench empty'}>
         {logs.length > 0 && (
