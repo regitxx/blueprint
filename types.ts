@@ -1,4 +1,4 @@
-export type AgentName = 'scout' | 'analyst' | 'architect' | 'system';
+export type AgentName = 'scout' | 'analyst' | 'architect' | 'reader' | 'system';
 
 export interface LogEntry {
   id: number;
@@ -55,4 +55,6 @@ export interface RunResult {
   insights: Insight[];
   variants: Variant[];
   comparison: ComparisonRow[];
+  constraints?: string[]; // hard constraints distilled from an uploaded idea doc
+  docName?: string; // filename of the uploaded idea doc, if any
 }

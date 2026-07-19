@@ -5,7 +5,7 @@
 // One env var works everywhere: gemini.ts reads process.env.API_KEY.
 process.env.API_KEY ||= process.env.GEMINI_API_KEY;
 
-import { analyzeSources, refineArchitectures, scoutQueries, synthesizeArchitectures } from '../services/gemini';
+import { analyzeSources, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from '../services/gemini';
 import { gatherSources } from '../services/sources';
 import type { ComparisonRow, Insight, Source, Variant } from '../types';
 
@@ -117,6 +117,19 @@ async function main(): Promise<void> {
   const costRow = refined.comparison.find((r) => /rough monthly cost/i.test(r.criterion));
   check('comparison contains a cost row', !!costRow,
     costRow ? `"${costRow.criterion}" = ${JSON.stringify(costRow.values)}` : 'no "Rough monthly cost" row found');
+
+  // ---------------- Reader (idea doc → topic + constraints) ----------------
+  const DOC = `Project brief: FieldNotes.
+We want a note-taking app for field researchers working in remote areas — biologists, geologists, archaeologists — who spend days away from any network. Core requirement: the entire app must work offline, capturing text, photos, GPS coordinates, and voice memos with zero connectivity, then syncing opportunistically when a connection returns. Because deployments run on cheap Android tablets and old laptops, there must be no vector database and no heavy embedding index on the device. Search should be simple keyword and tag matching over local storage. Conflict resolution on sync must be predictable and never silently drop a researcher's data. Nice to have later: shared team notebooks and a desktop review dashboard. Keep the stack boring and maintainable.`;
+  console.log('\nReader doc distillation:');
+  const reader = await stage<{ topic: string; constraints: string[]; nonGoals: string[] }>(
+    'reader',
+    () => readDocument(DOC),
+  );
+  console.log(`  topic: "${reader.topic}" (${reader.topic.length} chars)`);
+  console.log(`  constraints: ${JSON.stringify(reader.constraints)}`);
+  check('reader topic ≤90 chars', reader.topic.length <= 90, `got ${reader.topic.length}`);
+  check('reader captured ≥1 constraint', reader.constraints.length >= 1, `got ${reader.constraints.length}`);
 
   console.log(`\n${failed === 0 ? 'ALL CHECKS PASSED' : `${failed} CHECK(S) FAILED`}`);
   process.exit(failed === 0 ? 0 : 1);

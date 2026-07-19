@@ -1,15 +1,26 @@
 import { useCallback, useRef, useState } from 'react';
 import Results from './components/Results';
 import { CACHED_RUNS } from './constants';
-import { analyzeSources, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
+import { analyzeSources, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
 import { gatherSources } from './services/sources';
 import type { AgentName, LogEntry, RunResult } from './types';
 
 const AGENT_TAG: Record<AgentName, string> = {
-  scout: 'SCT', analyst: 'ANL', architect: 'ARC', system: 'SYS',
+  scout: 'SCT', analyst: 'ANL', architect: 'ARC', reader: 'RDR', system: 'SYS',
 };
 
+const MAX_DOC_BYTES = 2 * 1024 * 1024; // 2MB upload cap
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function readFileText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result ?? ''));
+    fr.onerror = () => reject(fr.error ?? new Error('file read failed'));
+    fr.readAsText(file);
+  });
+}
 
 // Run history — last 5 successful live runs, newest first, persisted in localStorage.
 const HISTORY_KEY = 'bp.history';
@@ -39,6 +50,7 @@ export default function App() {
   const [refining, setRefining] = useState(false);
   const logId = useRef(0);
   const runToken = useRef(0);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   // Inputs are locked while a fresh run OR a refine is in flight.
   const busy = phase === 'running' || refining;
@@ -63,10 +75,9 @@ export default function App() {
     return runToken.current;
   };
 
-  async function runLive(rawTopic: string) {
-    const t = rawTopic.trim();
-    if (!t || phase === 'running') return;
-    const token = begin(t);
+  // Core Scout → Analyst → Architect pipeline. Shared by the plain "Draft it" flow and the
+  // document-reader flow (which supplies distilled constraints + the doc name).
+  async function executePipeline(token: number, t: string, extra?: { constraints?: string[]; docName?: string }) {
     try {
       let id = log('scout', `Reading the idea: “${t}”`);
       const queries = await scoutQueries(t);
@@ -84,14 +95,14 @@ export default function App() {
       settle(id, 'ok');
       log('analyst', `Structured ${insights.length} source briefs`, 'ok');
 
-      id = log('architect', 'Synthesizing 2–3 variants with citations…');
-      const { variants, comparison } = await synthesizeArchitectures(t, sources, insights);
+      id = log('architect', extra?.constraints?.length ? `Synthesizing under ${extra.constraints.length} constraints…` : 'Synthesizing 2–3 variants with citations…');
+      const { variants, comparison } = await synthesizeArchitectures(t, sources, insights, extra?.constraints);
       settle(id, 'ok');
       log('architect', `Drafted ${variants.length} sheets + trade-off table`, 'ok');
       log('system', 'Blueprint ready. Every block links to a source.', 'ok');
 
       if (runToken.current !== token) return;
-      const run: RunResult = { topic: t, sources, insights, variants, comparison };
+      const run: RunResult = { topic: t, sources, insights, variants, comparison, constraints: extra?.constraints, docName: extra?.docName };
       setResult(run);
       setPhase('done');
       setHistory(pushHistory({ topic: t, savedAt: Date.now(), result: run }));
@@ -108,8 +119,41 @@ export default function App() {
     }
   }
 
+  async function runLive(rawTopic: string) {
+    const t = rawTopic.trim();
+    if (!t || busy) return;
+    const token = begin(t);
+    await executePipeline(token, t);
+  }
+
+  // Reader flow: upload an idea doc → distill topic + constraints → run the pipeline under them.
+  async function handleDoc(file: File) {
+    if (busy) return;
+    if (file.size > MAX_DOC_BYTES) {
+      setError(`“${file.name}” is ${(file.size / 1024 / 1024).toFixed(1)}MB — idea docs must be under 2MB.`);
+      return;
+    }
+    const token = begin(file.name);
+    try {
+      const text = await readFileText(file);
+      const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+      const rid = log('reader', `Reading ${file.name}: ${words} words…`);
+      const { topic: distilled, constraints } = await readDocument(text);
+      if (runToken.current !== token) return;
+      settle(rid, 'ok');
+      log('reader', `Distilled → “${distilled}” + ${constraints.length} constraints`, 'ok');
+      setTopic(distilled);
+      await executePipeline(token, distilled, { constraints, docName: file.name });
+    } catch (e) {
+      if (runToken.current !== token) return;
+      log('reader', e instanceof Error ? e.message : String(e), 'err');
+      setError('Could not read that document — try a .txt or .md idea doc.');
+      setPhase('error');
+    }
+  }
+
   async function runCached(run: RunResult) {
-    if (phase === 'running') return;
+    if (busy) return;
     const token = begin(run.topic);
     const step = async (agent: AgentName, text: string, ms: number) => {
       if (runToken.current !== token) throw new Error('cancelled');
@@ -138,7 +182,7 @@ export default function App() {
     const id = log('architect', `Refining: ${instr}`);
     try {
       const { variants, comparison } = await refineArchitectures(
-        result.topic, result.sources, result.insights, result.variants, instr,
+        result.topic, result.sources, result.insights, result.variants, instr, result.constraints,
       );
       settle(id, 'ok');
       log('architect', `Reworked ${variants.length} variants + trade-off table`, 'ok');
@@ -182,6 +226,16 @@ export default function App() {
           <button className="run" onClick={() => runLive(topic)} disabled={busy || !topic.trim()}>
             {phase === 'running' ? 'Drafting…' : 'Draft it'}
           </button>
+          <button className="chip chip-btn upload-chip" onClick={() => fileRef.current?.click()} disabled={busy}>
+            ⬆ Upload idea doc
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".txt,.md,text/plain,text/markdown"
+            hidden
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleDoc(f); e.target.value = ''; }}
+          />
         </div>
         <div className="chip-row demo-row">
           <span className="demo-label">Example blueprints — saved live runs:</span>
@@ -224,6 +278,14 @@ export default function App() {
         )}
         {result && (
           <div className="results-wrap">
+            {result.constraints && result.constraints.length > 0 && (
+              <div className="constraint-row" aria-label="Constraints from your document">
+                {result.docName && <span className="demo-label">⚑ {result.docName}</span>}
+                {result.constraints.map((c, i) => (
+                  <span key={i} className="chip constraint-chip">⚑ {c}</span>
+                ))}
+              </div>
+            )}
             <Results result={result} />
             <form
               className="refine-bar"

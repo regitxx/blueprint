@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type } from '@google/genai';
-import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, MODEL, SCOUT_SYSTEM } from '../constants';
+import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, MODEL, READER_SYSTEM, SCOUT_SYSTEM } from '../constants';
 import type { ComparisonRow, Insight, Source, Variant } from '../types';
 
 function getApiKey(): string {
@@ -46,6 +46,38 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
       await new Promise((r) => setTimeout(r, wait));
     }
   }
+}
+
+// ---------------- 0 · Reader (optional idea-doc → topic + constraints) ----------------
+
+export interface ReaderResult {
+  topic: string;
+  constraints: string[];
+  nonGoals: string[];
+}
+
+export async function readDocument(text: string): Promise<ReaderResult> {
+  const doc = (text ?? '').slice(0, 50_000); // guard token/cost blowups on large uploads
+  const res = await withRetry(() => ai().models.generateContent({
+    model: MODEL,
+    contents: `Idea document:\n\n${doc}\n\nDistill it now.`,
+    config: {
+      systemInstruction: READER_SYSTEM,
+      responseMimeType: 'application/json',
+      thinkingConfig: { thinkingLevel: 'low' } as any, // distillation is grounded in the doc; low reasoning cuts latency
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          topic: { type: Type.STRING, description: 'search-friendly product summary, ≤12 words' },
+          constraints: { type: Type.ARRAY, items: { type: Type.STRING }, description: '0-6 short imperatives that must shape the architecture' },
+          nonGoals: { type: Type.ARRAY, items: { type: Type.STRING }, description: '0-4 explicit out-of-scope items' },
+        },
+        required: ['topic', 'constraints', 'nonGoals'],
+      },
+    },
+  }));
+  const parsed = parseJson<ReaderResult>(res.text, 'Reader');
+  return { topic: parsed.topic, constraints: parsed.constraints ?? [], nonGoals: parsed.nonGoals ?? [] };
 }
 
 // ---------------- 1 · Scout ----------------
@@ -171,15 +203,22 @@ function buildBrief(sources: Source[], insights: Insight[]): string {
     .join('\n\n');
 }
 
+// A hard-constraints block appended to the architect prompt when the idea came from a doc.
+function constraintsBlock(constraints?: string[]): string {
+  if (!constraints?.length) return '';
+  return `\n\nHard constraints from the user's document — respect in every variant, flag in risks if impossible:\n${constraints.map((c) => `- ${c}`).join('\n')}`;
+}
+
 export async function synthesizeArchitectures(
   topic: string,
   sources: Source[],
   insights: Insight[],
+  constraints?: string[],
 ): Promise<{ variants: Variant[]; comparison: ComparisonRow[] }> {
   const brief = buildBrief(sources, insights);
   const res = await withRetry(() => ai().models.generateContent({
     model: MODEL,
-    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}\n\nDesign the architecture variants now.`,
+    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}${constraintsBlock(constraints)}\n\nDesign the architecture variants now.`,
     config: {
       systemInstruction: ARCHITECT_SYSTEM, // architect keeps default thinking — it does the hard synthesis
       responseMimeType: 'application/json',
@@ -197,12 +236,13 @@ export async function refineArchitectures(
   insights: Insight[],
   previousVariants: Variant[],
   instruction: string,
+  constraints?: string[],
 ): Promise<{ variants: Variant[]; comparison: ComparisonRow[] }> {
   const brief = buildBrief(sources, insights);
   const previous = JSON.stringify(previousVariants, null, 2);
   const res = await withRetry(() => ai().models.generateContent({
     model: MODEL,
-    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}\n\nPrevious variants (JSON):\n${previous}\n\nUser refine instruction: "${instruction}"\n\nRevise the variants now, grounded only in the insights above.`,
+    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}${constraintsBlock(constraints)}\n\nPrevious variants (JSON):\n${previous}\n\nUser refine instruction: "${instruction}"\n\nRevise the variants now, grounded only in the insights above.`,
     config: {
       systemInstruction: ARCHITECT_REFINE_SYSTEM,
       responseMimeType: 'application/json',

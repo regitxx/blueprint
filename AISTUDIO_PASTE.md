@@ -98,6 +98,8 @@
   }
   .refine-input:focus-visible, .refine-btn:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
   .refine-btn { font-size: 14px; padding: 0 22px; }
+  .constraint-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 16px; }
+  .constraint-chip { color: var(--amber); border: 1px solid var(--amber); background: rgba(245,185,95,.08); }
   .demo-row { margin-top: 12px; align-items: center; }
   .demo-label { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); margin-right: 4px; }
   .error { color: var(--err); margin: 10px 0 0; }
@@ -119,6 +121,7 @@
   .tag-scout { color: var(--cyan); border-color: var(--cyan); }
   .tag-analyst { color: var(--amber); border-color: var(--amber); }
   .tag-architect { color: #9FF5C0; border-color: #9FF5C0; }
+  .tag-reader { color: #C9A7F5; border-color: #C9A7F5; }
   .log-text { flex: 1; }
   .log-dot { color: var(--ink-dim); }
   .log-ok .log-dot { color: var(--cyan); }
@@ -207,7 +210,7 @@
 ## 3. types.ts
 
 ```ts
-export type AgentName = 'scout' | 'analyst' | 'architect' | 'system';
+export type AgentName = 'scout' | 'analyst' | 'architect' | 'reader' | 'system';
 
 export interface LogEntry {
   id: number;
@@ -264,6 +267,8 @@ export interface RunResult {
   insights: Insight[];
   variants: Variant[];
   comparison: ComparisonRow[];
+  constraints?: string[]; // hard constraints distilled from an uploaded idea doc
+  docName?: string; // filename of the uploaded idea doc, if any
 }
 ```
 
@@ -846,6 +851,8 @@ export const MODEL = (typeof process !== 'undefined' && process.env?.GEMINI_MODE
 
 export const SOURCE_LIMITS = { arxiv: 4, github: 3, total: 7 };
 
+export const READER_SYSTEM = `You are Reader, a requirements distiller. You are given an idea document (notes, a spec, a brief). Distill it into: "topic" — a search-friendly product summary of at most 12 words; "constraints" — 0 to 6 short imperatives that MUST shape the architecture (e.g. "Must work fully offline", "No vector database", "Sub-100ms p95 latency"); "nonGoals" — 0 to 4 things explicitly out of scope. Keep every item terse and concrete; do not invent constraints the document does not support. Output JSON only.`;
+
 export const SCOUT_SYSTEM = `You are Scout, a research-search strategist. Given a product idea, produce short, high-recall search queries. arXiv queries: 2-4 technical keywords each, no quotes, no boolean operators. GitHub queries: 2-3 keywords matching how real repos are named/described. Output JSON only.`;
 
 export const ANALYST_SYSTEM = `You are Analyst, a technical reader. For each source you receive (paper abstract or repo README excerpt), extract only what is stated or strongly implied. Be concrete and terse (1-2 sentences per field). If a field is not covered by the text, write "not stated". Never invent numbers. Output JSON only.`;
@@ -1057,7 +1064,7 @@ export async function gatherSources(arxivQueries: string[], githubQueries: strin
 
 ````ts
 import { GoogleGenAI, Type } from '@google/genai';
-import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, MODEL, SCOUT_SYSTEM } from '../constants';
+import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, MODEL, READER_SYSTEM, SCOUT_SYSTEM } from '../constants';
 import type { ComparisonRow, Insight, Source, Variant } from '../types';
 
 function getApiKey(): string {
@@ -1104,6 +1111,38 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
       await new Promise((r) => setTimeout(r, wait));
     }
   }
+}
+
+// ---------------- 0 · Reader (optional idea-doc → topic + constraints) ----------------
+
+export interface ReaderResult {
+  topic: string;
+  constraints: string[];
+  nonGoals: string[];
+}
+
+export async function readDocument(text: string): Promise<ReaderResult> {
+  const doc = (text ?? '').slice(0, 50_000); // guard token/cost blowups on large uploads
+  const res = await withRetry(() => ai().models.generateContent({
+    model: MODEL,
+    contents: `Idea document:\n\n${doc}\n\nDistill it now.`,
+    config: {
+      systemInstruction: READER_SYSTEM,
+      responseMimeType: 'application/json',
+      thinkingConfig: { thinkingLevel: 'low' } as any, // distillation is grounded in the doc; low reasoning cuts latency
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          topic: { type: Type.STRING, description: 'search-friendly product summary, ≤12 words' },
+          constraints: { type: Type.ARRAY, items: { type: Type.STRING }, description: '0-6 short imperatives that must shape the architecture' },
+          nonGoals: { type: Type.ARRAY, items: { type: Type.STRING }, description: '0-4 explicit out-of-scope items' },
+        },
+        required: ['topic', 'constraints', 'nonGoals'],
+      },
+    },
+  }));
+  const parsed = parseJson<ReaderResult>(res.text, 'Reader');
+  return { topic: parsed.topic, constraints: parsed.constraints ?? [], nonGoals: parsed.nonGoals ?? [] };
 }
 
 // ---------------- 1 · Scout ----------------
@@ -1229,15 +1268,22 @@ function buildBrief(sources: Source[], insights: Insight[]): string {
     .join('\n\n');
 }
 
+// A hard-constraints block appended to the architect prompt when the idea came from a doc.
+function constraintsBlock(constraints?: string[]): string {
+  if (!constraints?.length) return '';
+  return `\n\nHard constraints from the user's document — respect in every variant, flag in risks if impossible:\n${constraints.map((c) => `- ${c}`).join('\n')}`;
+}
+
 export async function synthesizeArchitectures(
   topic: string,
   sources: Source[],
   insights: Insight[],
+  constraints?: string[],
 ): Promise<{ variants: Variant[]; comparison: ComparisonRow[] }> {
   const brief = buildBrief(sources, insights);
   const res = await withRetry(() => ai().models.generateContent({
     model: MODEL,
-    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}\n\nDesign the architecture variants now.`,
+    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}${constraintsBlock(constraints)}\n\nDesign the architecture variants now.`,
     config: {
       systemInstruction: ARCHITECT_SYSTEM, // architect keeps default thinking — it does the hard synthesis
       responseMimeType: 'application/json',
@@ -1255,12 +1301,13 @@ export async function refineArchitectures(
   insights: Insight[],
   previousVariants: Variant[],
   instruction: string,
+  constraints?: string[],
 ): Promise<{ variants: Variant[]; comparison: ComparisonRow[] }> {
   const brief = buildBrief(sources, insights);
   const previous = JSON.stringify(previousVariants, null, 2);
   const res = await withRetry(() => ai().models.generateContent({
     model: MODEL,
-    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}\n\nPrevious variants (JSON):\n${previous}\n\nUser refine instruction: "${instruction}"\n\nRevise the variants now, grounded only in the insights above.`,
+    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}${constraintsBlock(constraints)}\n\nPrevious variants (JSON):\n${previous}\n\nUser refine instruction: "${instruction}"\n\nRevise the variants now, grounded only in the insights above.`,
     config: {
       systemInstruction: ARCHITECT_REFINE_SYSTEM,
       responseMimeType: 'application/json',
@@ -1463,15 +1510,26 @@ export default function Results({ result }: { result: RunResult }) {
 import { useCallback, useRef, useState } from 'react';
 import Results from './components/Results';
 import { CACHED_RUNS } from './constants';
-import { analyzeSources, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
+import { analyzeSources, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
 import { gatherSources } from './services/sources';
 import type { AgentName, LogEntry, RunResult } from './types';
 
 const AGENT_TAG: Record<AgentName, string> = {
-  scout: 'SCT', analyst: 'ANL', architect: 'ARC', system: 'SYS',
+  scout: 'SCT', analyst: 'ANL', architect: 'ARC', reader: 'RDR', system: 'SYS',
 };
 
+const MAX_DOC_BYTES = 2 * 1024 * 1024; // 2MB upload cap
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function readFileText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result ?? ''));
+    fr.onerror = () => reject(fr.error ?? new Error('file read failed'));
+    fr.readAsText(file);
+  });
+}
 
 // Run history — last 5 successful live runs, newest first, persisted in localStorage.
 const HISTORY_KEY = 'bp.history';
@@ -1501,6 +1559,7 @@ export default function App() {
   const [refining, setRefining] = useState(false);
   const logId = useRef(0);
   const runToken = useRef(0);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   // Inputs are locked while a fresh run OR a refine is in flight.
   const busy = phase === 'running' || refining;
@@ -1525,10 +1584,9 @@ export default function App() {
     return runToken.current;
   };
 
-  async function runLive(rawTopic: string) {
-    const t = rawTopic.trim();
-    if (!t || phase === 'running') return;
-    const token = begin(t);
+  // Core Scout → Analyst → Architect pipeline. Shared by the plain "Draft it" flow and the
+  // document-reader flow (which supplies distilled constraints + the doc name).
+  async function executePipeline(token: number, t: string, extra?: { constraints?: string[]; docName?: string }) {
     try {
       let id = log('scout', `Reading the idea: “${t}”`);
       const queries = await scoutQueries(t);
@@ -1546,14 +1604,14 @@ export default function App() {
       settle(id, 'ok');
       log('analyst', `Structured ${insights.length} source briefs`, 'ok');
 
-      id = log('architect', 'Synthesizing 2–3 variants with citations…');
-      const { variants, comparison } = await synthesizeArchitectures(t, sources, insights);
+      id = log('architect', extra?.constraints?.length ? `Synthesizing under ${extra.constraints.length} constraints…` : 'Synthesizing 2–3 variants with citations…');
+      const { variants, comparison } = await synthesizeArchitectures(t, sources, insights, extra?.constraints);
       settle(id, 'ok');
       log('architect', `Drafted ${variants.length} sheets + trade-off table`, 'ok');
       log('system', 'Blueprint ready. Every block links to a source.', 'ok');
 
       if (runToken.current !== token) return;
-      const run: RunResult = { topic: t, sources, insights, variants, comparison };
+      const run: RunResult = { topic: t, sources, insights, variants, comparison, constraints: extra?.constraints, docName: extra?.docName };
       setResult(run);
       setPhase('done');
       setHistory(pushHistory({ topic: t, savedAt: Date.now(), result: run }));
@@ -1570,8 +1628,41 @@ export default function App() {
     }
   }
 
+  async function runLive(rawTopic: string) {
+    const t = rawTopic.trim();
+    if (!t || busy) return;
+    const token = begin(t);
+    await executePipeline(token, t);
+  }
+
+  // Reader flow: upload an idea doc → distill topic + constraints → run the pipeline under them.
+  async function handleDoc(file: File) {
+    if (busy) return;
+    if (file.size > MAX_DOC_BYTES) {
+      setError(`“${file.name}” is ${(file.size / 1024 / 1024).toFixed(1)}MB — idea docs must be under 2MB.`);
+      return;
+    }
+    const token = begin(file.name);
+    try {
+      const text = await readFileText(file);
+      const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+      const rid = log('reader', `Reading ${file.name}: ${words} words…`);
+      const { topic: distilled, constraints } = await readDocument(text);
+      if (runToken.current !== token) return;
+      settle(rid, 'ok');
+      log('reader', `Distilled → “${distilled}” + ${constraints.length} constraints`, 'ok');
+      setTopic(distilled);
+      await executePipeline(token, distilled, { constraints, docName: file.name });
+    } catch (e) {
+      if (runToken.current !== token) return;
+      log('reader', e instanceof Error ? e.message : String(e), 'err');
+      setError('Could not read that document — try a .txt or .md idea doc.');
+      setPhase('error');
+    }
+  }
+
   async function runCached(run: RunResult) {
-    if (phase === 'running') return;
+    if (busy) return;
     const token = begin(run.topic);
     const step = async (agent: AgentName, text: string, ms: number) => {
       if (runToken.current !== token) throw new Error('cancelled');
@@ -1600,7 +1691,7 @@ export default function App() {
     const id = log('architect', `Refining: ${instr}`);
     try {
       const { variants, comparison } = await refineArchitectures(
-        result.topic, result.sources, result.insights, result.variants, instr,
+        result.topic, result.sources, result.insights, result.variants, instr, result.constraints,
       );
       settle(id, 'ok');
       log('architect', `Reworked ${variants.length} variants + trade-off table`, 'ok');
@@ -1644,6 +1735,16 @@ export default function App() {
           <button className="run" onClick={() => runLive(topic)} disabled={busy || !topic.trim()}>
             {phase === 'running' ? 'Drafting…' : 'Draft it'}
           </button>
+          <button className="chip chip-btn upload-chip" onClick={() => fileRef.current?.click()} disabled={busy}>
+            ⬆ Upload idea doc
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".txt,.md,text/plain,text/markdown"
+            hidden
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleDoc(f); e.target.value = ''; }}
+          />
         </div>
         <div className="chip-row demo-row">
           <span className="demo-label">Example blueprints — saved live runs:</span>
@@ -1686,6 +1787,14 @@ export default function App() {
         )}
         {result && (
           <div className="results-wrap">
+            {result.constraints && result.constraints.length > 0 && (
+              <div className="constraint-row" aria-label="Constraints from your document">
+                {result.docName && <span className="demo-label">⚑ {result.docName}</span>}
+                {result.constraints.map((c, i) => (
+                  <span key={i} className="chip constraint-chip">⚑ {c}</span>
+                ))}
+              </div>
+            )}
             <Results result={result} />
             <form
               className="refine-bar"

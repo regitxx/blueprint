@@ -16,6 +16,25 @@ const UPSTREAM = 'https://generativelanguage.googleapis.com';
 const GENAI_PREFIX = '/api/genai/';
 const ARXIV_UPSTREAM = 'https://export.arxiv.org';
 const ARXIV_PATH = '/api/arxiv';
+const IS_PROD = process.env.NODE_ENV === 'production';
+
+// In dev, Vite serves the app (HMR off) via middleware so `npm run dev` uses this same
+// server + proxies — aligning local dev with the AI Studio / production container path.
+let viteMiddlewares = null;
+async function setupDevMiddleware() {
+  if (IS_PROD) return;
+  try {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true, hmr: false },
+      appType: 'spa',
+    });
+    viteMiddlewares = vite.middlewares;
+    console.log('Vite dev middleware active (HMR off) — serving app from source.');
+  } catch (err) {
+    console.warn(`Vite dev middleware unavailable, falling back to ./dist: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 // Key is read at request time from the environment — never baked into the bundle, never logged.
 const apiKey = () => process.env.GEMINI_API_KEY || process.env.API_KEY || '';
@@ -138,9 +157,19 @@ const server = createServer((req, res) => {
     });
     return;
   }
+  // Non-/api requests: Vite in dev (with static fallback), built ./dist in prod.
+  if (viteMiddlewares) {
+    viteMiddlewares(req, res, () => serveStatic(req, res));
+    return;
+  }
   serveStatic(req, res);
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Blueprint server listening on http://${HOST}:${PORT} — serving ./dist, genai proxy ${apiKey() ? 'ready' : 'MISSING KEY'}`);
-});
+async function start() {
+  await setupDevMiddleware();
+  server.listen(PORT, HOST, () => {
+    const mode = viteMiddlewares ? 'dev (vite middleware)' : 'serving ./dist';
+    console.log(`Blueprint server listening on http://${HOST}:${PORT} — ${mode}, genai proxy ${apiKey() ? 'ready' : 'MISSING KEY'}`);
+  });
+}
+start();
