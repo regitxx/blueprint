@@ -5,6 +5,12 @@ export const MODEL = (typeof process !== 'undefined' && process.env?.GEMINI_MODE
 
 export const SOURCE_LIMITS = { arxiv: 4, github: 3, total: 7 };
 
+export const CARTOGRAPHER_SYSTEM = `You are Cartographer, a reverse-engineer. You are given a repository's metadata, file tree, README, a manifest, and a few entry files. Produce ONLY what these files actually support — never invent components, files, or capabilities not evidenced by the inputs. Output JSON with: "summary" (≤2 sentences describing what the repo is and does); "detectedStack" (≤6 short strings, concrete technologies you can see, e.g. "Express", "TypeScript", "PostgreSQL"); "asBuilt" — one variant object describing the CURRENT system: { "name": "As-built — <repo>", "profile": "As-built", "tagline", "summary", "mermaid", "components": [{ "name", "role", "paths": [real file/dir paths copied verbatim from the provided tree] }], "risks" (observed weaknesses or gaps in the actual code), "whenToChoose": "This is the current system." }; and seed queries { "arxivQueries": [2 queries], "githubQueries": [2 queries] } targeting how the detected stack could evolve (scaling, robustness, next-gen techniques).
+
+Mermaid rules (strict): output "flowchart TD" only; node ids A, B, C...; every label in double quotes; no parentheses, brackets, semicolons or the word "end" inside labels; max 12 nodes; edges may have short labels.
+
+Every path in components MUST be a real path present in the provided file tree — do not guess paths. Output JSON only.`;
+
 export const READER_SYSTEM = `You are Reader, a requirements distiller. You are given an idea document (notes, a spec, a brief). Distill it into: "topic" — a search-friendly product summary of at most 12 words; "constraints" — 0 to 6 short imperatives that MUST shape the architecture (e.g. "Must work fully offline", "No vector database", "Sub-100ms p95 latency"); "nonGoals" — 0 to 4 things explicitly out of scope. Keep every item terse and concrete; do not invent constraints the document does not support. Output JSON only.`;
 
 export const SCOUT_SYSTEM = `You are Scout, a research-search strategist. Given a product idea, produce short, high-recall search queries. arXiv queries: 2-4 technical keywords each, no quotes, no boolean operators. GitHub queries: 2-3 keywords matching how real repos are named/described. Output JSON only.`;

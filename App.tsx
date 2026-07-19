@@ -1,13 +1,16 @@
 import { useCallback, useRef, useState } from 'react';
 import Results from './components/Results';
 import { CACHED_RUNS } from './constants';
-import { analyzeSources, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
+import { analyzeSources, mapRepoArchitecture, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
 import { gatherSources } from './services/sources';
-import type { AgentName, LogEntry, RunResult } from './types';
+import { fetchRepoSkeleton } from './services/repo';
+import type { AgentName, LogEntry, RunResult, Source, Variant } from './types';
 
 const AGENT_TAG: Record<AgentName, string> = {
-  scout: 'SCT', analyst: 'ANL', architect: 'ARC', reader: 'RDR', system: 'SYS',
+  scout: 'SCT', analyst: 'ANL', architect: 'ARC', reader: 'RDR', cartographer: 'MAP', system: 'SYS',
 };
+
+const REPO_RE = /github\.com\/([\w.-]+)\/([\w.-]+)/;
 
 const MAX_DOC_BYTES = 2 * 1024 * 1024; // 2MB upload cap
 
@@ -122,8 +125,104 @@ export default function App() {
   async function runLive(rawTopic: string) {
     const t = rawTopic.trim();
     if (!t || busy) return;
+    const repoMatch = t.match(REPO_RE);
     const token = begin(t);
-    await executePipeline(token, t);
+    if (repoMatch) {
+      const owner = repoMatch[1];
+      const repo = repoMatch[2].replace(/\.git$/, '');
+      await runRepoAnalysis(token, owner, repo, t);
+    } else {
+      await executePipeline(token, t);
+    }
+  }
+
+  // Cartographer flow: repo URL → as-built sheet 0 → seeded research → evolution variants.
+  async function runRepoAnalysis(token: number, owner: string, repo: string, repoUrl: string) {
+    const label = `${owner}/${repo}`;
+    try {
+      const skeleton = await fetchRepoSkeleton(owner, repo, (m) => log('cartographer', m, 'ok'));
+
+      // Draw the as-built sheet (sheet 0).
+      const drawId = log('cartographer', 'Drawing as-built sheet 0…');
+      const repoMap = await mapRepoArchitecture(label, skeleton);
+      if (runToken.current !== token) return;
+
+      // Repo-file Sources so as-built citations resolve. One Source per cited path;
+      // snippet is the file's first 200 chars when fetched, else the component's role.
+      const fetched = new Map(skeleton.files.map((f) => [f.path, f.content]));
+      const compPaths: string[] = [];
+      for (const c of repoMap.asBuilt.components) {
+        for (const p of c.paths) if (!compPaths.includes(p)) compPaths.push(p);
+      }
+      const roleOf = (p: string) => repoMap.asBuilt.components.find((c) => c.paths.includes(p))?.role ?? '';
+      const repoSources: Source[] = compPaths.map((p, i) => ({
+        id: `r${i + 1}`,
+        kind: 'repo',
+        origin: 'Repo',
+        title: p,
+        url: `https://github.com/${owner}/${repo}/blob/${skeleton.meta.defaultBranch}/${p}`,
+        snippet: fetched.get(p)?.slice(0, 200) || roleOf(p) || 'Repository file.',
+        meta: skeleton.meta.language || undefined,
+      }));
+      const pathToId = new Map(repoSources.map((s) => [s.title, s.id]));
+
+      const asBuiltVariant: Variant = {
+        id: 'as-built',
+        name: repoMap.asBuilt.name,
+        profile: repoMap.asBuilt.profile,
+        tagline: repoMap.asBuilt.tagline,
+        summary: repoMap.asBuilt.summary,
+        mermaid: repoMap.asBuilt.mermaid,
+        components: repoMap.asBuilt.components.map((c) => ({
+          name: c.name,
+          role: c.role,
+          sourceIds: c.paths.map((p) => pathToId.get(p)).filter((x): x is string => Boolean(x)),
+        })),
+        risks: repoMap.asBuilt.risks,
+        whenToChoose: repoMap.asBuilt.whenToChoose,
+      };
+      settle(drawId, 'ok');
+      log('cartographer', `Sheet 0 drawn: ${asBuiltVariant.components.length} components`, 'ok');
+
+      // Seeded research (skip Scout — the Cartographer already produced targeted queries).
+      let id = log('scout', `Seeded research → arXiv: ${repoMap.arxivQueries.join(' | ')}`, 'ok');
+      id = log('scout', 'Searching arXiv and GitHub (seeded)…');
+      const researchSources = await gatherSources(repoMap.arxivQueries, repoMap.githubQueries, (m) => log('scout', m, 'ok'));
+      settle(id, 'ok');
+
+      id = log('analyst', `Extracting from ${researchSources.length} research sources…`);
+      const insights = await analyzeSources(label, researchSources);
+      settle(id, 'ok');
+      log('analyst', `Structured ${insights.length} source briefs`, 'ok');
+
+      id = log('architect', 'Proposing evolution variants vs as-built…');
+      // Pass the raw as-built (components described by paths, no sourceIds/id) so the architect
+      // can't mistake the as-built for a citable source.
+      const asBuiltContext = { summary: repoMap.summary, detectedStack: repoMap.detectedStack, asBuilt: repoMap.asBuilt };
+      const { variants: evolution, comparison } = await synthesizeArchitectures(label, researchSources, insights, undefined, asBuiltContext);
+      settle(id, 'ok');
+      log('architect', `Drafted ${evolution.length} evolution sheets vs as-built`, 'ok');
+      log('system', 'Blueprint ready. Sheet 0 is the current system.', 'ok');
+
+      if (runToken.current !== token) return;
+      const run: RunResult = {
+        topic: label,
+        sources: [...repoSources, ...researchSources],
+        insights,
+        variants: [asBuiltVariant, ...evolution],
+        comparison,
+        repoUrl,
+      };
+      setResult(run);
+      setPhase('done');
+      setHistory(pushHistory({ topic: label, savedAt: Date.now(), result: run }));
+    } catch (e) {
+      if (runToken.current !== token) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      log('cartographer', msg, 'err');
+      setError(`${msg}`);
+      setPhase('error');
+    }
   }
 
   // Reader flow: upload an idea doc → distill topic + constraints → run the pipeline under them.
@@ -220,7 +319,7 @@ export default function App() {
             value={topic}
             onChange={(e) => setTopic(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && runLive(topic)}
-            placeholder="e.g. a distributed database built on AI agents"
+            placeholder="e.g. an idea — or paste a github.com/owner/repo link"
             disabled={busy}
           />
           <button className="run" onClick={() => runLive(topic)} disabled={busy || !topic.trim()}>

@@ -1,6 +1,7 @@
 import { GoogleGenAI, Type } from '@google/genai';
-import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, MODEL, READER_SYSTEM, SCOUT_SYSTEM } from '../constants';
+import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, CARTOGRAPHER_SYSTEM, MODEL, READER_SYSTEM, SCOUT_SYSTEM } from '../constants';
 import type { ComparisonRow, Insight, Source, Variant } from '../types';
+import type { RepoSkeleton } from './repo';
 
 function getApiKey(): string {
   // Vite's define replaces the literal `process.env.API_KEY` at build time; the try/catch
@@ -214,11 +215,15 @@ export async function synthesizeArchitectures(
   sources: Source[],
   insights: Insight[],
   constraints?: string[],
+  asBuilt?: unknown,
 ): Promise<{ variants: Variant[]; comparison: ComparisonRow[] }> {
   const brief = buildBrief(sources, insights);
+  const asBuiltBlock = asBuilt
+    ? `\n\nAs-built architecture (JSON):\n${JSON.stringify(asBuilt)}\n\nPropose evolution variants RELATIVE to this as-built architecture; comparison MUST include 'As-built (today)' as the FIRST column. Every evolution component must cite sourceIds drawn ONLY from the Source insights above — never cite the as-built architecture itself as a source.`
+    : '';
   const res = await withRetry(() => ai().models.generateContent({
     model: MODEL,
-    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}${constraintsBlock(constraints)}\n\nDesign the architecture variants now.`,
+    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}${constraintsBlock(constraints)}${asBuiltBlock}\n\nDesign the architecture variants now.`,
     config: {
       systemInstruction: ARCHITECT_SYSTEM, // architect keeps default thinking — it does the hard synthesis
       responseMimeType: 'application/json',
@@ -250,4 +255,83 @@ export async function refineArchitectures(
     },
   }));
   return parseJson(res.text, 'Refine');
+}
+
+// ---------------- 4 · Cartographer (repo → as-built sheet + seed queries) ----------------
+
+// Raw Cartographer output: as-built components cite real tree PATHS (not sourceIds yet).
+export interface RepoMap {
+  summary: string;
+  detectedStack: string[];
+  asBuilt: {
+    name: string;
+    profile: string;
+    tagline: string;
+    summary: string;
+    mermaid: string;
+    components: { name: string; role: string; paths: string[] }[];
+    risks: string;
+    whenToChoose: string;
+  };
+  arxivQueries: string[];
+  githubQueries: string[];
+}
+
+const repoMapSchema = {
+  type: Type.OBJECT,
+  properties: {
+    summary: { type: Type.STRING, description: '≤2 sentences' },
+    detectedStack: { type: Type.ARRAY, items: { type: Type.STRING }, description: '≤6 concrete technologies' },
+    asBuilt: {
+      type: Type.OBJECT,
+      properties: {
+        name: { type: Type.STRING, description: 'As-built — <repo>' },
+        profile: { type: Type.STRING, description: 'As-built' },
+        tagline: { type: Type.STRING },
+        summary: { type: Type.STRING },
+        mermaid: { type: Type.STRING, description: 'flowchart TD, quoted labels, max 12 nodes' },
+        components: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              name: { type: Type.STRING },
+              role: { type: Type.STRING },
+              paths: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'real paths copied from the tree' },
+            },
+            required: ['name', 'role', 'paths'],
+          },
+        },
+        risks: { type: Type.STRING },
+        whenToChoose: { type: Type.STRING, description: 'This is the current system.' },
+      },
+      required: ['name', 'profile', 'tagline', 'summary', 'mermaid', 'components', 'risks', 'whenToChoose'],
+    },
+    arxivQueries: { type: Type.ARRAY, items: { type: Type.STRING }, description: '2 queries on the stack\'s evolution' },
+    githubQueries: { type: Type.ARRAY, items: { type: Type.STRING }, description: '2 queries on the stack\'s evolution' },
+  },
+  required: ['summary', 'detectedStack', 'asBuilt', 'arxivQueries', 'githubQueries'],
+};
+
+export async function mapRepoArchitecture(repoName: string, skeleton: RepoSkeleton): Promise<RepoMap> {
+  const { meta, paths, truncated, files } = skeleton;
+  const tree = paths.join('\n') + (truncated ? '\n…(tree truncated)' : '');
+  const fileBlocks = files.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n');
+  const contents =
+    `Repository: ${repoName}\n` +
+    `Description: ${meta.description || '(none)'}\n` +
+    `Primary language: ${meta.language || '(unknown)'} · Stars: ${meta.stars} · Default branch: ${meta.defaultBranch}\n\n` +
+    `FILE TREE (${paths.length} paths):\n${tree}\n\n` +
+    `FILE CONTENTS:\n${fileBlocks}\n\n` +
+    `Map the as-built architecture now, citing only real paths from the tree.`;
+  const res = await withRetry(() => ai().models.generateContent({
+    model: MODEL,
+    contents,
+    config: {
+      systemInstruction: CARTOGRAPHER_SYSTEM,
+      responseMimeType: 'application/json',
+      responseSchema: repoMapSchema,
+    },
+  }));
+  return parseJson<RepoMap>(res.text, 'Cartographer');
 }

@@ -122,6 +122,7 @@
   .tag-analyst { color: var(--amber); border-color: var(--amber); }
   .tag-architect { color: #9FF5C0; border-color: #9FF5C0; }
   .tag-reader { color: #C9A7F5; border-color: #C9A7F5; }
+  .tag-cartographer { color: #7FE0D6; border-color: #7FE0D6; }
   .log-text { flex: 1; }
   .log-dot { color: var(--ink-dim); }
   .log-ok .log-dot { color: var(--cyan); }
@@ -210,7 +211,7 @@
 ## 3. types.ts
 
 ```ts
-export type AgentName = 'scout' | 'analyst' | 'architect' | 'reader' | 'system';
+export type AgentName = 'scout' | 'analyst' | 'architect' | 'reader' | 'cartographer' | 'system';
 
 export interface LogEntry {
   id: number;
@@ -269,6 +270,7 @@ export interface RunResult {
   comparison: ComparisonRow[];
   constraints?: string[]; // hard constraints distilled from an uploaded idea doc
   docName?: string; // filename of the uploaded idea doc, if any
+  repoUrl?: string; // github.com/owner/repo, when the run started from a repo URL
 }
 ```
 
@@ -851,6 +853,12 @@ export const MODEL = (typeof process !== 'undefined' && process.env?.GEMINI_MODE
 
 export const SOURCE_LIMITS = { arxiv: 4, github: 3, total: 7 };
 
+export const CARTOGRAPHER_SYSTEM = `You are Cartographer, a reverse-engineer. You are given a repository's metadata, file tree, README, a manifest, and a few entry files. Produce ONLY what these files actually support — never invent components, files, or capabilities not evidenced by the inputs. Output JSON with: "summary" (≤2 sentences describing what the repo is and does); "detectedStack" (≤6 short strings, concrete technologies you can see, e.g. "Express", "TypeScript", "PostgreSQL"); "asBuilt" — one variant object describing the CURRENT system: { "name": "As-built — <repo>", "profile": "As-built", "tagline", "summary", "mermaid", "components": [{ "name", "role", "paths": [real file/dir paths copied verbatim from the provided tree] }], "risks" (observed weaknesses or gaps in the actual code), "whenToChoose": "This is the current system." }; and seed queries { "arxivQueries": [2 queries], "githubQueries": [2 queries] } targeting how the detected stack could evolve (scaling, robustness, next-gen techniques).
+
+Mermaid rules (strict): output "flowchart TD" only; node ids A, B, C...; every label in double quotes; no parentheses, brackets, semicolons or the word "end" inside labels; max 12 nodes; edges may have short labels.
+
+Every path in components MUST be a real path present in the provided file tree — do not guess paths. Output JSON only.`;
+
 export const READER_SYSTEM = `You are Reader, a requirements distiller. You are given an idea document (notes, a spec, a brief). Distill it into: "topic" — a search-friendly product summary of at most 12 words; "constraints" — 0 to 6 short imperatives that MUST shape the architecture (e.g. "Must work fully offline", "No vector database", "Sub-100ms p95 latency"); "nonGoals" — 0 to 4 things explicitly out of scope. Keep every item terse and concrete; do not invent constraints the document does not support. Output JSON only.`;
 
 export const SCOUT_SYSTEM = `You are Scout, a research-search strategist. Given a product idea, produce short, high-recall search queries. arXiv queries: 2-4 technical keywords each, no quotes, no boolean operators. GitHub queries: 2-3 keywords matching how real repos are named/described. Output JSON only.`;
@@ -1060,12 +1068,146 @@ export async function gatherSources(arxivQueries: string[], githubQueries: strin
 }
 ````
 
-## 7. services/gemini.ts
+## 7. services/repo.ts
+
+```ts
+// Repo skeleton fetcher for the Cartographer agent.
+// GitHub's core API is 60 req/hr unauthenticated, so we spend at most TWO core calls per
+// analysis (repo meta + git tree). ALL file content comes from raw.githubusercontent.com,
+// which is not rate-limited the same way.
+
+export interface RepoMeta {
+  owner: string;
+  repo: string;
+  defaultBranch: string;
+  description: string;
+  language: string;
+  stars: number;
+}
+
+export interface RepoSkeleton {
+  meta: RepoMeta;
+  paths: string[]; // up to 500 tree paths (for the prompt)
+  truncated: boolean; // true if the tree was capped or GitHub truncated it
+  files: { path: string; content: string }[];
+}
+
+const RATE_LIMIT_MSG = 'Repo not found, private, or rate-limited — try again or use a public repo';
+
+// Manifest files in priority order — first one that exists wins.
+const MANIFESTS = ['package.json', 'pyproject.toml', 'go.mod', 'Cargo.toml', 'requirements.txt'];
+
+// Entry-file heuristics in priority order.
+const ENTRY_PATTERNS: RegExp[] = [
+  /^src\/index\.[^/]+$/,
+  /^src\/main\.[^/]+$/,
+  /^index\.[^/]+$/,
+  /^main\.[^/]+$/,
+  /^app\.[^/]+$/,
+  /^server\.[^/]+$/,
+  /^cmd\/.+\/main\.go$/,
+];
+
+async function fetchRaw(owner: string, repo: string, branches: string[], path: string): Promise<string | null> {
+  for (const b of branches) {
+    try {
+      const r = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${b}/${path}`);
+      if (r.ok) return await r.text();
+    } catch { /* try next branch */ }
+  }
+  return null;
+}
+
+export async function fetchRepoSkeleton(
+  owner: string,
+  repo: string,
+  log: (t: string) => void,
+): Promise<RepoSkeleton> {
+  // ---- Core call 1/2: repo metadata ----
+  const metaRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+    headers: { Accept: 'application/vnd.github+json' },
+  });
+  if (metaRes.status === 404 || metaRes.status === 403) throw new Error(RATE_LIMIT_MSG);
+  if (!metaRes.ok) throw new Error(`GitHub repo HTTP ${metaRes.status}`);
+  const m = (await metaRes.json()) as {
+    default_branch?: string; description?: string | null; language?: string | null; stargazers_count?: number;
+  };
+  const meta: RepoMeta = {
+    owner,
+    repo,
+    defaultBranch: m.default_branch || 'main',
+    description: m.description || '',
+    language: m.language || '',
+    stars: m.stargazers_count || 0,
+  };
+
+  // ---- Core call 2/2: recursive git tree ----
+  const treeRes = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/trees/${meta.defaultBranch}?recursive=1`,
+    { headers: { Accept: 'application/vnd.github+json' } },
+  );
+  if (treeRes.status === 404 || treeRes.status === 403) throw new Error(RATE_LIMIT_MSG);
+  if (!treeRes.ok) throw new Error(`GitHub tree HTTP ${treeRes.status}`);
+  const t = (await treeRes.json()) as { tree?: { path: string; type: string }[]; truncated?: boolean };
+  const allPaths = (t.tree ?? []).filter((n) => n.type === 'blob').map((n) => n.path);
+  const truncated = Boolean(t.truncated) || allPaths.length > 500;
+  const paths = allPaths.slice(0, 500);
+  log(`Mapping ${owner}/${repo}: ${allPaths.length} files${truncated ? ' (tree truncated to 500)' : ''}…`);
+
+  // ---- Content via raw (no core-API cost) ----
+  const branches = [...new Set([meta.defaultBranch, 'main', 'master'])];
+  const files: { path: string; content: string }[] = [];
+  let budget = 40 * 1024; // total content budget across all files
+
+  const add = (path: string, raw: string | null, capKB: number): boolean => {
+    if (!raw || budget <= 0) return false;
+    let content = raw.length > capKB * 1024 ? raw.slice(0, capKB * 1024) : raw;
+    if (content.length > budget) content = content.slice(0, budget);
+    if (!content) return false;
+    files.push({ path, content });
+    budget -= content.length;
+    return true;
+  };
+
+  // README (prefer the real path from the tree)
+  const readmePath = paths.find((p) => /^readme\.(md|markdown)$/i.test(p)) || paths.find((p) => /readme\.(md|markdown)$/i.test(p));
+  let readmeCount = 0;
+  if (readmePath) readmeCount = add(readmePath, await fetchRaw(owner, repo, branches, readmePath), 8) ? 1 : 0;
+
+  // First existing manifest
+  const manifestPath = MANIFESTS.map((name) => paths.find((p) => p === name)).find(Boolean)
+    || MANIFESTS.map((name) => paths.find((p) => p.endsWith(`/${name}`))).find(Boolean);
+  let manifestCount = 0;
+  if (manifestPath) manifestCount = add(manifestPath, await fetchRaw(owner, repo, branches, manifestPath), 6) ? 1 : 0;
+
+  // Up to 5 entry files by heuristic, in priority order
+  const entryPaths: string[] = [];
+  for (const re of ENTRY_PATTERNS) {
+    for (const p of paths) {
+      if (entryPaths.length >= 5) break;
+      if (re.test(p) && !entryPaths.includes(p)) entryPaths.push(p);
+    }
+    if (entryPaths.length >= 5) break;
+  }
+  let entryCount = 0;
+  for (const p of entryPaths) {
+    if (budget <= 0) break;
+    if (add(p, await fetchRaw(owner, repo, branches, p), 6)) entryCount++;
+  }
+
+  log(`Read ${readmeCount ? 'README' : 'no README'} + ${manifestCount ? 'manifest' : 'no manifest'} + ${entryCount} entry files`);
+
+  return { meta, paths, truncated, files };
+}
+```
+
+## 8. services/gemini.ts
 
 ````ts
 import { GoogleGenAI, Type } from '@google/genai';
-import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, MODEL, READER_SYSTEM, SCOUT_SYSTEM } from '../constants';
+import { ANALYST_SYSTEM, ARCHITECT_REFINE_SYSTEM, ARCHITECT_SYSTEM, CARTOGRAPHER_SYSTEM, MODEL, READER_SYSTEM, SCOUT_SYSTEM } from '../constants';
 import type { ComparisonRow, Insight, Source, Variant } from '../types';
+import type { RepoSkeleton } from './repo';
 
 function getApiKey(): string {
   // Vite's define replaces the literal `process.env.API_KEY` at build time; the try/catch
@@ -1279,11 +1421,15 @@ export async function synthesizeArchitectures(
   sources: Source[],
   insights: Insight[],
   constraints?: string[],
+  asBuilt?: unknown,
 ): Promise<{ variants: Variant[]; comparison: ComparisonRow[] }> {
   const brief = buildBrief(sources, insights);
+  const asBuiltBlock = asBuilt
+    ? `\n\nAs-built architecture (JSON):\n${JSON.stringify(asBuilt)}\n\nPropose evolution variants RELATIVE to this as-built architecture; comparison MUST include 'As-built (today)' as the FIRST column. Every evolution component must cite sourceIds drawn ONLY from the Source insights above — never cite the as-built architecture itself as a source.`
+    : '';
   const res = await withRetry(() => ai().models.generateContent({
     model: MODEL,
-    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}${constraintsBlock(constraints)}\n\nDesign the architecture variants now.`,
+    contents: `User idea: "${topic}".\n\nSource insights:\n\n${brief}${constraintsBlock(constraints)}${asBuiltBlock}\n\nDesign the architecture variants now.`,
     config: {
       systemInstruction: ARCHITECT_SYSTEM, // architect keeps default thinking — it does the hard synthesis
       responseMimeType: 'application/json',
@@ -1316,9 +1462,88 @@ export async function refineArchitectures(
   }));
   return parseJson(res.text, 'Refine');
 }
+
+// ---------------- 4 · Cartographer (repo → as-built sheet + seed queries) ----------------
+
+// Raw Cartographer output: as-built components cite real tree PATHS (not sourceIds yet).
+export interface RepoMap {
+  summary: string;
+  detectedStack: string[];
+  asBuilt: {
+    name: string;
+    profile: string;
+    tagline: string;
+    summary: string;
+    mermaid: string;
+    components: { name: string; role: string; paths: string[] }[];
+    risks: string;
+    whenToChoose: string;
+  };
+  arxivQueries: string[];
+  githubQueries: string[];
+}
+
+const repoMapSchema = {
+  type: Type.OBJECT,
+  properties: {
+    summary: { type: Type.STRING, description: '≤2 sentences' },
+    detectedStack: { type: Type.ARRAY, items: { type: Type.STRING }, description: '≤6 concrete technologies' },
+    asBuilt: {
+      type: Type.OBJECT,
+      properties: {
+        name: { type: Type.STRING, description: 'As-built — <repo>' },
+        profile: { type: Type.STRING, description: 'As-built' },
+        tagline: { type: Type.STRING },
+        summary: { type: Type.STRING },
+        mermaid: { type: Type.STRING, description: 'flowchart TD, quoted labels, max 12 nodes' },
+        components: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              name: { type: Type.STRING },
+              role: { type: Type.STRING },
+              paths: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'real paths copied from the tree' },
+            },
+            required: ['name', 'role', 'paths'],
+          },
+        },
+        risks: { type: Type.STRING },
+        whenToChoose: { type: Type.STRING, description: 'This is the current system.' },
+      },
+      required: ['name', 'profile', 'tagline', 'summary', 'mermaid', 'components', 'risks', 'whenToChoose'],
+    },
+    arxivQueries: { type: Type.ARRAY, items: { type: Type.STRING }, description: '2 queries on the stack\'s evolution' },
+    githubQueries: { type: Type.ARRAY, items: { type: Type.STRING }, description: '2 queries on the stack\'s evolution' },
+  },
+  required: ['summary', 'detectedStack', 'asBuilt', 'arxivQueries', 'githubQueries'],
+};
+
+export async function mapRepoArchitecture(repoName: string, skeleton: RepoSkeleton): Promise<RepoMap> {
+  const { meta, paths, truncated, files } = skeleton;
+  const tree = paths.join('\n') + (truncated ? '\n…(tree truncated)' : '');
+  const fileBlocks = files.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n');
+  const contents =
+    `Repository: ${repoName}\n` +
+    `Description: ${meta.description || '(none)'}\n` +
+    `Primary language: ${meta.language || '(unknown)'} · Stars: ${meta.stars} · Default branch: ${meta.defaultBranch}\n\n` +
+    `FILE TREE (${paths.length} paths):\n${tree}\n\n` +
+    `FILE CONTENTS:\n${fileBlocks}\n\n` +
+    `Map the as-built architecture now, citing only real paths from the tree.`;
+  const res = await withRetry(() => ai().models.generateContent({
+    model: MODEL,
+    contents,
+    config: {
+      systemInstruction: CARTOGRAPHER_SYSTEM,
+      responseMimeType: 'application/json',
+      responseSchema: repoMapSchema,
+    },
+  }));
+  return parseJson<RepoMap>(res.text, 'Cartographer');
+}
 ````
 
-## 8. components/Results.tsx
+## 9. components/Results.tsx
 
 ```tsx
 import mermaid from 'mermaid';
@@ -1504,19 +1729,22 @@ export default function Results({ result }: { result: RunResult }) {
 }
 ```
 
-## 9. App.tsx
+## 10. App.tsx
 
 ```tsx
 import { useCallback, useRef, useState } from 'react';
 import Results from './components/Results';
 import { CACHED_RUNS } from './constants';
-import { analyzeSources, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
+import { analyzeSources, mapRepoArchitecture, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from './services/gemini';
 import { gatherSources } from './services/sources';
-import type { AgentName, LogEntry, RunResult } from './types';
+import { fetchRepoSkeleton } from './services/repo';
+import type { AgentName, LogEntry, RunResult, Source, Variant } from './types';
 
 const AGENT_TAG: Record<AgentName, string> = {
-  scout: 'SCT', analyst: 'ANL', architect: 'ARC', reader: 'RDR', system: 'SYS',
+  scout: 'SCT', analyst: 'ANL', architect: 'ARC', reader: 'RDR', cartographer: 'MAP', system: 'SYS',
 };
+
+const REPO_RE = /github\.com\/([\w.-]+)\/([\w.-]+)/;
 
 const MAX_DOC_BYTES = 2 * 1024 * 1024; // 2MB upload cap
 
@@ -1631,8 +1859,104 @@ export default function App() {
   async function runLive(rawTopic: string) {
     const t = rawTopic.trim();
     if (!t || busy) return;
+    const repoMatch = t.match(REPO_RE);
     const token = begin(t);
-    await executePipeline(token, t);
+    if (repoMatch) {
+      const owner = repoMatch[1];
+      const repo = repoMatch[2].replace(/\.git$/, '');
+      await runRepoAnalysis(token, owner, repo, t);
+    } else {
+      await executePipeline(token, t);
+    }
+  }
+
+  // Cartographer flow: repo URL → as-built sheet 0 → seeded research → evolution variants.
+  async function runRepoAnalysis(token: number, owner: string, repo: string, repoUrl: string) {
+    const label = `${owner}/${repo}`;
+    try {
+      const skeleton = await fetchRepoSkeleton(owner, repo, (m) => log('cartographer', m, 'ok'));
+
+      // Draw the as-built sheet (sheet 0).
+      const drawId = log('cartographer', 'Drawing as-built sheet 0…');
+      const repoMap = await mapRepoArchitecture(label, skeleton);
+      if (runToken.current !== token) return;
+
+      // Repo-file Sources so as-built citations resolve. One Source per cited path;
+      // snippet is the file's first 200 chars when fetched, else the component's role.
+      const fetched = new Map(skeleton.files.map((f) => [f.path, f.content]));
+      const compPaths: string[] = [];
+      for (const c of repoMap.asBuilt.components) {
+        for (const p of c.paths) if (!compPaths.includes(p)) compPaths.push(p);
+      }
+      const roleOf = (p: string) => repoMap.asBuilt.components.find((c) => c.paths.includes(p))?.role ?? '';
+      const repoSources: Source[] = compPaths.map((p, i) => ({
+        id: `r${i + 1}`,
+        kind: 'repo',
+        origin: 'Repo',
+        title: p,
+        url: `https://github.com/${owner}/${repo}/blob/${skeleton.meta.defaultBranch}/${p}`,
+        snippet: fetched.get(p)?.slice(0, 200) || roleOf(p) || 'Repository file.',
+        meta: skeleton.meta.language || undefined,
+      }));
+      const pathToId = new Map(repoSources.map((s) => [s.title, s.id]));
+
+      const asBuiltVariant: Variant = {
+        id: 'as-built',
+        name: repoMap.asBuilt.name,
+        profile: repoMap.asBuilt.profile,
+        tagline: repoMap.asBuilt.tagline,
+        summary: repoMap.asBuilt.summary,
+        mermaid: repoMap.asBuilt.mermaid,
+        components: repoMap.asBuilt.components.map((c) => ({
+          name: c.name,
+          role: c.role,
+          sourceIds: c.paths.map((p) => pathToId.get(p)).filter((x): x is string => Boolean(x)),
+        })),
+        risks: repoMap.asBuilt.risks,
+        whenToChoose: repoMap.asBuilt.whenToChoose,
+      };
+      settle(drawId, 'ok');
+      log('cartographer', `Sheet 0 drawn: ${asBuiltVariant.components.length} components`, 'ok');
+
+      // Seeded research (skip Scout — the Cartographer already produced targeted queries).
+      let id = log('scout', `Seeded research → arXiv: ${repoMap.arxivQueries.join(' | ')}`, 'ok');
+      id = log('scout', 'Searching arXiv and GitHub (seeded)…');
+      const researchSources = await gatherSources(repoMap.arxivQueries, repoMap.githubQueries, (m) => log('scout', m, 'ok'));
+      settle(id, 'ok');
+
+      id = log('analyst', `Extracting from ${researchSources.length} research sources…`);
+      const insights = await analyzeSources(label, researchSources);
+      settle(id, 'ok');
+      log('analyst', `Structured ${insights.length} source briefs`, 'ok');
+
+      id = log('architect', 'Proposing evolution variants vs as-built…');
+      // Pass the raw as-built (components described by paths, no sourceIds/id) so the architect
+      // can't mistake the as-built for a citable source.
+      const asBuiltContext = { summary: repoMap.summary, detectedStack: repoMap.detectedStack, asBuilt: repoMap.asBuilt };
+      const { variants: evolution, comparison } = await synthesizeArchitectures(label, researchSources, insights, undefined, asBuiltContext);
+      settle(id, 'ok');
+      log('architect', `Drafted ${evolution.length} evolution sheets vs as-built`, 'ok');
+      log('system', 'Blueprint ready. Sheet 0 is the current system.', 'ok');
+
+      if (runToken.current !== token) return;
+      const run: RunResult = {
+        topic: label,
+        sources: [...repoSources, ...researchSources],
+        insights,
+        variants: [asBuiltVariant, ...evolution],
+        comparison,
+        repoUrl,
+      };
+      setResult(run);
+      setPhase('done');
+      setHistory(pushHistory({ topic: label, savedAt: Date.now(), result: run }));
+    } catch (e) {
+      if (runToken.current !== token) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      log('cartographer', msg, 'err');
+      setError(`${msg}`);
+      setPhase('error');
+    }
   }
 
   // Reader flow: upload an idea doc → distill topic + constraints → run the pipeline under them.
@@ -1729,7 +2053,7 @@ export default function App() {
             value={topic}
             onChange={(e) => setTopic(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && runLive(topic)}
-            placeholder="e.g. a distributed database built on AI agents"
+            placeholder="e.g. an idea — or paste a github.com/owner/repo link"
             disabled={busy}
           />
           <button className="run" onClick={() => runLive(topic)} disabled={busy || !topic.trim()}>
@@ -1831,7 +2155,7 @@ export default function App() {
 }
 ```
 
-## 10. index.tsx
+## 11. index.tsx
 
 ```tsx
 import { createRoot } from 'react-dom/client';

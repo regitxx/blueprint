@@ -5,8 +5,9 @@
 // One env var works everywhere: gemini.ts reads process.env.API_KEY.
 process.env.API_KEY ||= process.env.GEMINI_API_KEY;
 
-import { analyzeSources, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from '../services/gemini';
+import { analyzeSources, mapRepoArchitecture, readDocument, refineArchitectures, scoutQueries, synthesizeArchitectures } from '../services/gemini';
 import { gatherSources } from '../services/sources';
+import { fetchRepoSkeleton } from '../services/repo';
 import type { ComparisonRow, Insight, Source, Variant } from '../types';
 
 const TOPIC = 'realtime collaborative whiteboard with AI diagram cleanup';
@@ -130,6 +131,73 @@ We want a note-taking app for field researchers working in remote areas — biol
   console.log(`  constraints: ${JSON.stringify(reader.constraints)}`);
   check('reader topic ≤90 chars', reader.topic.length <= 90, `got ${reader.topic.length}`);
   check('reader captured ≥1 constraint', reader.constraints.length >= 1, `got ${reader.constraints.length}`);
+
+  // ---------------- Phase R (cartographer: repo → as-built + evolution) ----------------
+  console.log('\nPhase R — cartographer (expressjs/express):');
+  const now = () => Date.now();
+  let skeleton: Awaited<ReturnType<typeof fetchRepoSkeleton>> | null = null;
+  try {
+    const t0 = now();
+    skeleton = await fetchRepoSkeleton('expressjs', 'express', (m) => console.log(`    · ${m}`));
+    console.log(`✓ fetchRepoSkeleton: ${now() - t0}ms — ${skeleton.files.length} files, ${skeleton.paths.length} tree paths`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/rate-limited|Repo not found/i.test(msg)) {
+      console.log('Phase R SKIPPED (rate limit)');
+    } else {
+      console.error(`Phase R error: ${msg}`);
+      process.exit(1);
+    }
+  }
+
+  if (skeleton) {
+    check('repo skeleton has files', skeleton.files.length > 0, `got ${skeleton.files.length}`);
+
+    const tRepo = skeleton;
+    const repoMap = await stage('mapRepoArchitecture', () => mapRepoArchitecture('expressjs/express', tRepo));
+    const treePaths = new Set(tRepo.paths);
+    check('as-built ≥3 components', repoMap.asBuilt.components.length >= 3, `got ${repoMap.asBuilt.components.length}`);
+    check('as-built non-empty mermaid', !!repoMap.asBuilt.mermaid?.trim());
+    const offTree = repoMap.asBuilt.components.flatMap((c) => c.paths).filter((p) => !treePaths.has(p));
+    check('every component path ∈ fetched tree', offTree.length === 0, offTree.slice(0, 5).join(', '));
+
+    // Build repo Sources + as-built Variant (mirrors App).
+    const fetched = new Map(tRepo.files.map((f) => [f.path, f.content]));
+    const compPaths: string[] = [];
+    for (const c of repoMap.asBuilt.components) for (const p of c.paths) if (!compPaths.includes(p)) compPaths.push(p);
+    const roleOf = (p: string) => repoMap.asBuilt.components.find((c) => c.paths.includes(p))?.role ?? '';
+    const repoSources: Source[] = compPaths.map((p, i) => ({
+      id: `r${i + 1}`, kind: 'repo', origin: 'Repo', title: p,
+      url: `https://github.com/expressjs/express/blob/${tRepo.meta.defaultBranch}/${p}`,
+      snippet: fetched.get(p)?.slice(0, 200) || roleOf(p) || 'Repository file.',
+    }));
+    const pathToId = new Map(repoSources.map((s) => [s.title, s.id]));
+    const asBuiltVariant: Variant = {
+      id: 'as-built', name: repoMap.asBuilt.name, profile: repoMap.asBuilt.profile,
+      tagline: repoMap.asBuilt.tagline, summary: repoMap.asBuilt.summary, mermaid: repoMap.asBuilt.mermaid,
+      components: repoMap.asBuilt.components.map((c) => ({
+        name: c.name, role: c.role, sourceIds: c.paths.map((p) => pathToId.get(p)).filter((x): x is string => Boolean(x)),
+      })),
+      risks: repoMap.asBuilt.risks, whenToChoose: repoMap.asBuilt.whenToChoose,
+    };
+
+    const researchSources = await stage('seeded gatherSources', () =>
+      gatherSources(repoMap.arxivQueries, repoMap.githubQueries, (m) => console.log(`    · ${m}`)));
+    const repoInsights = await stage('analyst(research)', () => analyzeSources('expressjs/express', researchSources));
+    const asBuiltContext = { summary: repoMap.summary, detectedStack: repoMap.detectedStack, asBuilt: repoMap.asBuilt };
+    const evo = await stage<{ variants: Variant[]; comparison: ComparisonRow[] }>('evolution architect', () =>
+      synthesizeArchitectures('expressjs/express', researchSources, repoInsights, undefined, asBuiltContext));
+
+    const finalSources = [...repoSources, ...researchSources];
+    const finalVariants = [asBuiltVariant, ...evo.variants];
+    const finalIds = new Set(finalSources.map((s) => s.id));
+    console.log(`  as-built + ${evo.variants.length} evolution variants; ${finalSources.length} sources`);
+
+    console.log('\nPhase R checks:');
+    runChecks(finalVariants, evo.comparison, finalIds);
+    check('first column is As-built', /as-built/i.test(finalVariants[0].name) || /as-built/i.test(finalVariants[0].profile),
+      `first variant: "${finalVariants[0].name}"`);
+  }
 
   console.log(`\n${failed === 0 ? 'ALL CHECKS PASSED' : `${failed} CHECK(S) FAILED`}`);
   process.exit(failed === 0 ? 0 : 1);
