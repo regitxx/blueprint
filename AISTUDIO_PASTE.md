@@ -1266,18 +1266,36 @@ function parseJson<T>(raw: string | undefined, stage: string): T {
   }
 }
 
+// Some deploy envs (AI Studio preview/published) reject thinkingConfig with 400 INVALID_ARGUMENT,
+// while local/Mac envs accept it. Start optimistic; flip off permanently the first time an env
+// rejects it, and re-issue the offending call without it.
+let thinkingOk = true;
+const LOW_THINKING = { thinkingLevel: 'low' };
+function withThinking<T extends object>(config: T): T {
+  return thinkingOk ? ({ ...config, thinkingConfig: LOW_THINKING } as unknown as T) : config;
+}
+
 // Retry only transient capacity/availability errors. Backoff: 2s then 5s, each + 0–500ms jitter.
-async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
+// When canDegradeThinking is set, a 400 INVALID_ARGUMENT (while thinkingConfig was in play) flips
+// thinkingOk off and retries once immediately — NOT counted against the transient-retry budget.
+async function withRetry<T>(fn: () => Promise<T>, tries = 3, canDegradeThinking = false): Promise<T> {
   const delays = [2000, 5000];
-  for (let attempt = 0; ; attempt++) {
+  let attempt = 0;
+  for (;;) {
+    const usedThinking = thinkingOk;
     try {
       return await fn();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (canDegradeThinking && usedThinking && thinkingOk && /INVALID_ARGUMENT|invalid argument/i.test(msg)) {
+        thinkingOk = false; // this env rejects thinkingConfig — retry immediately without it
+        continue; // not counted against `tries`
+      }
       const retryable = /429|RESOURCE_EXHAUSTED|503|UNAVAILABLE/i.test(msg);
       if (!retryable || attempt >= tries - 1) throw err;
       const wait = delays[Math.min(attempt, delays.length - 1)] + Math.floor(Math.random() * 500);
       await new Promise((r) => setTimeout(r, wait));
+      attempt++;
     }
   }
 }
@@ -1293,10 +1311,9 @@ export async function interpretIdea(topic: string): Promise<Interpretations> {
   const res = await withRetry(() => ai().models.generateContent({
     model: MODEL,
     contents: `Product idea: "${topic}". Decide whether it is ambiguous and, if so, enumerate the distinct readings.`,
-    config: {
+    config: withThinking({
       systemInstruction: INTERPRETER_SYSTEM,
       responseMimeType: 'application/json',
-      thinkingConfig: { thinkingLevel: 'low' } as any, // fast pre-research gate; low reasoning cuts latency
       responseSchema: {
         type: Type.OBJECT,
         properties: {
@@ -1318,8 +1335,8 @@ export async function interpretIdea(topic: string): Promise<Interpretations> {
         },
         required: ['ambiguous', 'interpretations'],
       },
-    },
-  }));
+    }),
+  }), 3, true);
   const parsed = parseJson<{ ambiguous: boolean; interpretations: Omit<Interpretation, 'id'>[] }>(res.text, 'Interpreter');
   return {
     ambiguous: parsed.ambiguous,
@@ -1340,10 +1357,9 @@ export async function readDocument(text: string): Promise<ReaderResult> {
   const res = await withRetry(() => ai().models.generateContent({
     model: MODEL,
     contents: `Idea document:\n\n${doc}\n\nDistill it now.`,
-    config: {
+    config: withThinking({
       systemInstruction: READER_SYSTEM,
       responseMimeType: 'application/json',
-      thinkingConfig: { thinkingLevel: 'low' } as any, // distillation is grounded in the doc; low reasoning cuts latency
       responseSchema: {
         type: Type.OBJECT,
         properties: {
@@ -1353,8 +1369,8 @@ export async function readDocument(text: string): Promise<ReaderResult> {
         },
         required: ['topic', 'constraints', 'nonGoals'],
       },
-    },
-  }));
+    }),
+  }), 3, true);
   const parsed = parseJson<ReaderResult>(res.text, 'Reader');
   return { topic: parsed.topic, constraints: parsed.constraints ?? [], nonGoals: parsed.nonGoals ?? [] };
 }
@@ -1365,10 +1381,9 @@ export async function scoutQueries(topic: string): Promise<{ arxivQueries: strin
   const res = await withRetry(() => ai().models.generateContent({
     model: MODEL,
     contents: `Product idea: "${topic}". Produce search queries.`,
-    config: {
+    config: withThinking({
       systemInstruction: SCOUT_SYSTEM,
       responseMimeType: 'application/json',
-      thinkingConfig: { thinkingLevel: 'low' } as any, // low reasoning is enough for query generation; cuts latency
       responseSchema: {
         type: Type.OBJECT,
         properties: {
@@ -1377,8 +1392,8 @@ export async function scoutQueries(topic: string): Promise<{ arxivQueries: strin
         },
         required: ['arxivQueries', 'githubQueries'],
       },
-    },
-  }));
+    }),
+  }), 3, true);
   return parseJson(res.text, 'Scout');
 }
 
@@ -1413,13 +1428,12 @@ export async function analyzeSources(topic: string, sources: Source[]): Promise<
   const res = await withRetry(() => ai().models.generateContent({
     model: MODEL,
     contents: `User idea: "${topic}".\n\nExtract insights for EVERY source below (one entry per sourceId).\n\n${corpus}`,
-    config: {
+    config: withThinking({
       systemInstruction: ANALYST_SYSTEM,
       responseMimeType: 'application/json',
-      thinkingConfig: { thinkingLevel: 'low' } as any, // extraction is grounded in the corpus; low reasoning cuts latency
       responseSchema: insightSchema,
-    },
-  }));
+    }),
+  }), 3, true);
   return parseJson<{ insights: Insight[] }>(res.text, 'Analyst').insights;
 }
 
